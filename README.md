@@ -53,7 +53,7 @@ Thesis project: wearable smart watch วัด HR + SpO2 แสดงบนจ�
 1. Upload sketch ครั้งแรก → วางนิ้วที่ sensor นิ่งๆ ~60-90 วิ (calibrate)
 2. ค่า calibration บันทึกใน flash — **boot ครั้งถัดไปไม่ต้อง calibrate ใหม่**
 3. วางนิ้วที่ sensor → จอแสดง HR (bpm) + SpO2 (%) อัปเดตทุก 2 วิ
-4. ส่ง `r` ทาง Serial Monitor เพื่อ recalibrate ใหม่
+4. หาก calibrate ใหม่: ลบ NVS ผ่าน Arduino → Tools → Erase Flash แล้ว upload ใหม่
 
 ## Display Layout
 
