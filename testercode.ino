@@ -3,6 +3,7 @@
 #include "max32664.h"
 #include <Arduino_GFX_Library.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <time.h>
 
@@ -23,8 +24,10 @@
 #define TFT_BL      4
 
 // -------- WIFI / DASHBOARD --------
-#define WIFI_SSID     "YOUR_WIFI_SSID"
-#define WIFI_PASS     "YOUR_WIFI_PASSWORD"
+// ไม่ hardcode SSID/password แล้ว — ใช้ WiFiManager ให้ผู้ใช้ตั้งค่าเองผ่านหน้าเว็บตอนบูตครั้งแรก (บันทึกลง flash เอง)
+#define WIFI_MANAGER_AP_NAME         "SmartWatch-Setup"  // ชื่อ AP ตอนเปิดหน้าตั้งค่า WiFi
+#define WIFI_CONFIG_PORTAL_TIMEOUT_S 180UL                // ปิด portal เองถ้าไม่มีใครตั้งค่าใน 3 นาที (กันเปิดค้างกินแบต)
+#define BOOT_BTN_PIN                 9                    // ปุ่ม BOOT บนบอร์ด XIAO ESP32C3 (active LOW) กดค้างตอนเปิดเครื่อง = ลืม WiFi เดิม
 #define API_URL       "http://YOUR_DASHBOARD_HOST/api/vitals"  // แก้เป็น endpoint ของ dashboard
 #define DEVICE_NAME   "smartwatch-01"
 
@@ -79,8 +82,12 @@ int  lastMinShown = -1;
 unsigned long lastUpdate = 0;
 unsigned long detectStart = 0;
 unsigned long fingerLostAt = 0;   // เวลาที่นิ้วหลุดล่าสุด (0 = นิ้วยังอยู่)
+unsigned long fingerOffSince = 0; // debounce ตอนรอ "ยกนิ้ว" กันหลุดหลอกหลัง restartEstimation()
+#define RELEASE_DEBOUNCE_MS 400UL // ต้องไม่มีนิ้วต่อเนื่องเกินนี้ ถึงถือว่ายกนิ้วจริง
+unsigned long resultShownAt = 0;  // เวลาที่เพิ่งวาดผลวัดล่าสุดบนหน้า home
+#define MIN_HOME_HOLD_MS 3000UL   // การันตีค่าที่วัดได้ค้างจออย่างน้อยเท่านี้ ไม่ว่าจะมีอะไรมาทำให้สแกนใหม่ก่อนก็ตาม
 
-float finalHr = 0, finalSpo2 = 0, finalSys = 0, finalDia = 0;
+float finalHr = 0, finalSpo2 = 0, finalSys = 0, finalDia = 0, finalRR = 0;
 
 // ตัวสะสมค่าเฉลี่ยระหว่างสแกน
 float sumHr = 0, sumSpo2 = 0, sumSys = 0, sumDia = 0;
@@ -178,17 +185,50 @@ void restartEstimation() {
 }
 
 // -------- WIFI + JSON UPLOAD --------
+// ใช้ WiFiManager แทน hardcode SSID/password: ถ้าเคยตั้งค่าไว้แล้วจะต่อเองอัตโนมัติ
+// ถ้ายังไม่เคยตั้ง (หรือกดปุ่ม BOOT ค้างตอนเปิดเครื่อง) จะเปิด AP ชื่อ WIFI_MANAGER_AP_NAME
+// ให้เอามือถือ/คอมไปต่อ แล้วเข้า http://192.168.4.1 เพื่อเลือก WiFi + ใส่รหัสผ่าน (บันทึกลง flash เอง ไม่ต้องแก้โค้ดใหม่)
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi connecting");
-  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-    delay(500);
-    Serial.print(".");
+  WiFi.setSleep(false); // เน็ต IoT บางที่ตัดการเชื่อมต่อถ้าเข้า power-save
+  Serial.printf("Device MAC: %s (เอาไปแจ้ง IT ลงทะเบียน MAC ถ้าเน็ตต้อง whitelist)\n", WiFi.macAddress().c_str());
+
+  // สแกนแล้ว print SSID ที่มองเห็นจริงออก Serial — เอาไว้เช็คว่า AP เป้าหมายสัญญาณอ่อน/มองไม่เห็นจริงไหม
+  int found = WiFi.scanNetworks();
+  Serial.printf("WiFi scan: found %d network(s)\n", found);
+  for (int i = 0; i < found; i++) {
+    Serial.printf("  %2d) %-32s RSSI=%d dBm  ch=%d  %s\n",
+                  i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
+                  WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "SECURED");
   }
-  wifiOk = (WiFi.status() == WL_CONNECTED);
-  Serial.printf("\nWiFi: %s\n", wifiOk ? WiFi.localIP().toString().c_str() : "FAILED (offline mode)");
-  if (wifiOk) configTime(TZ_OFFSET_SEC, 0, NTP_SERVER); // เวลาจริงจาก NTP sync เองเบื้องหลัง
+
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(WIFI_CONFIG_PORTAL_TIMEOUT_S);
+  wm.setConnectTimeout(20);   // เน็ต IoT บางที่ handshake ช้า ค่า default สั้นไปอาจ timeout ก่อนต่อสำเร็จ
+  wm.setConnectRetries(3);    // ลองต่อซ้ำก่อนจะถือว่า fail จริง (กันสัญญาณอ่อน/หลุดชั่วขณะ)
+
+  if (digitalRead(BOOT_BTN_PIN) == LOW) {
+    Serial.println("BOOT held at boot -> ลืม WiFi เดิม เปิดหน้าตั้งค่าใหม่");
+    wm.resetSettings();
+  }
+
+  gfx->fillScreen(C_BLACK);
+  drawCenter("WIFI SETUP", 70, 2, C_WARN);
+  drawCenter("Connect phone to:", 110, 1, C_WHITE);
+  drawCenter(WIFI_MANAGER_AP_NAME, 130, 2, C_CYAN);
+  drawCenter("then open 192.168.4.1", 160, 1, C_GRAY);
+  drawCenter("(skip if already set up)", 180, 1, C_GRAY);
+
+  wifiOk = wm.autoConnect(WIFI_MANAGER_AP_NAME);
+
+  if (wifiOk) {
+    Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
+    configTime(TZ_OFFSET_SEC, 0, NTP_SERVER); // เวลาจริงจาก NTP sync เองเบื้องหลัง
+  } else {
+    // status code: 1=NO_SSID_AVAIL, 4=CONNECT_FAILED (มักเป็น MAC ยังไม่ลงทะเบียน/รหัสผิด), 6=WRONG_PASSWORD
+    Serial.printf("WiFi FAILED (offline mode), status code=%d\n", WiFi.status());
+  }
 }
 
 // -------- BATTERY --------
@@ -199,24 +239,45 @@ int readBatteryPct() {
   return constrain(pct, 0, 100);
 }
 
-// ส่งผลวัดขึ้น dashboard: {"device":"...","hr":72,"spo2":98,"bp":"120/80"}
+// ประมาณอัตราการหายใจจาก HR — เซนเซอร์นี้ไม่มีทางวัด RR ตรงๆ ได้
+// ใช้สัดส่วน HR:RR ~4:1 ที่พบทั่วไปตอนพัก (คร่าวๆเท่านั้น ไม่ใช่ค่าวัดจริง แม่นยำต่ำกว่า HR/SpO2/BP มาก)
+float estimateRespRate(float hr) {
+  return constrain(hr / 4.0f, 8.0f, 40.0f);
+}
+
+// ดึงเวลาปัจจุบันเป็น ISO8601 "YYYY-MM-DDTHH:MM:SS" จาก NTP, false ถ้ายังไม่ sync
+bool getIsoTimestamp(char *buf, size_t len) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  strftime(buf, len, "%Y-%m-%dT%H:%M:%S", &t);
+  return true;
+}
+
+// ส่งผลวัดขึ้น dashboard: {"device_id":"...","heart_rate":72,"spo2":98,"respiratory_rate":18,"blood_pressure_sys":120,"blood_pressure_dia":80,"timestamp":"..."}
+// ไม่ส่ง patient_id (dashboard ผูก device_id กับผู้ป่วยเอง) และไม่ส่ง temperature (เซนเซอร์นี้วัดไม่ได้ และไม่มีสูตรคำนวณที่น่าเชื่อถือ)
 bool sendVitals(float hr, float spo2, float sys, float dia) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Send skipped: no WiFi");
     return false;
   }
 
-  char json[160];
+  float rr = estimateRespRate(hr);
+  char ts[24];
+  bool haveTs = getIsoTimestamp(ts, sizeof(ts));
+
+  char json[224];
+  int n = snprintf(json, sizeof(json),
+    "{\"device_id\":\"%s\",\"heart_rate\":%d,\"spo2\":%d,\"respiratory_rate\":%d",
+    DEVICE_NAME, (int)hr, (int)spo2, (int)rr);
   if (sys > 0 && dia > 0) {
-    snprintf(json, sizeof(json),
-      "{\"device\":\"%s\",\"hr\":%d,\"spo2\":%d,\"bp\":\"%d/%d\"}",
-      DEVICE_NAME, (int)hr, (int)spo2, (int)sys, (int)dia);
-  } else {
     // BP เป็น optional — ไม่มีค่าก็ไม่ส่ง field
-    snprintf(json, sizeof(json),
-      "{\"device\":\"%s\",\"hr\":%d,\"spo2\":%d}",
-      DEVICE_NAME, (int)hr, (int)spo2);
+    n += snprintf(json + n, sizeof(json) - n,
+      ",\"blood_pressure_sys\":%d,\"blood_pressure_dia\":%d", (int)sys, (int)dia);
   }
+  if (haveTs) {
+    n += snprintf(json + n, sizeof(json) - n, ",\"timestamp\":\"%s\"", ts);
+  }
+  snprintf(json + n, sizeof(json) - n, "}");
 
   HTTPClient http;
   http.begin(API_URL);
@@ -249,17 +310,22 @@ void drawHome() {
     // vitals (เปลี่ยนเฉพาะหลังวัดเสร็จ -> วาดตรงนี้พอ)
     if (finalHr > 0) sprintf(buf, "HR   : %d", (int)finalHr);
     else             strcpy(buf, "HR   : --");
-    drawCenter(buf, 120, 2, C_RED);
+    drawCenter(buf, 105, 2, C_RED);
 
     if (finalSpo2 > 0) sprintf(buf, "SpO2 : %d%%", (int)finalSpo2);
     else               strcpy(buf, "SpO2 : --");
-    drawCenter(buf, 150, 2, C_CYAN);
+    drawCenter(buf, 130, 2, C_CYAN);
 
     if (finalSys > 0 && finalDia > 0) sprintf(buf, "BP   : %d/%d", (int)finalSys, (int)finalDia);
     else                              strcpy(buf, "BP   : --/--");
-    drawCenter(buf, 180, 2, C_GREEN);
+    drawCenter(buf, 155, 2, C_GREEN);
 
-    drawCenter("Place finger to scan", 208, 1, C_GRAY);
+    // RR เป็นค่าประมาณจาก HR (ไม่มี sensor วัดตรง) จึงโชว์คู่กับ "~" กันเข้าใจผิดว่าเป็นค่าวัดจริง
+    if (finalRR > 0) sprintf(buf, "RR ~ : %d", (int)finalRR);
+    else              strcpy(buf, "RR ~ : --");
+    drawCenter(buf, 180, 2, C_WARN);
+
+    drawCenter("Place finger to scan", 205, 1, C_GRAY);
   } else if (millis() - lastUpdate < 1000) {
     return; // อัปเดตช่องที่เปลี่ยนวินาทีละครั้งพอ
   }
@@ -432,8 +498,18 @@ void loop() {
 
     case CLOCK_MODE:
       drawHome();
-      if (haveSample && !fingerOn) needRelease = false; // ยกนิ้วแล้ว พร้อมวัดรอบใหม่
-      if (haveSample && fingerOn && !needRelease) {
+      // debounce "ยกนิ้ว": ต้องไม่มีนิ้วต่อเนื่องเกิน RELEASE_DEBOUNCE_MS ถึงเคลียร์ needRelease
+      // กัน sample หลอกหลัง restartEstimation() ทำให้จอกลับเข้า DETECTING ทันทีจนเห็นค่าใหม่ไม่ทัน
+      if (haveSample) {
+        if (!fingerOn) {
+          if (fingerOffSince == 0) fingerOffSince = millis();
+          if (needRelease && millis() - fingerOffSince > RELEASE_DEBOUNCE_MS) needRelease = false;
+        } else {
+          fingerOffSince = 0;
+        }
+      }
+      // ต้องค้างหน้าผลลัพธ์ให้ครบ MIN_HOME_HOLD_MS ก่อน ถึงจะยอมเริ่มสแกนรอบใหม่
+      if (haveSample && fingerOn && !needRelease && millis() - resultShownAt >= MIN_HOME_HOLD_MS) {
         // เจอนิ้ว -> เริ่มสแกนทันที
         resetScan();
         detectStart = millis();
@@ -475,6 +551,7 @@ void loop() {
         finalSpo2 = sumSpo2 / nSamples;
         finalSys  = nBpSamples ? sumSys / nBpSamples : 0;
         finalDia  = nBpSamples ? sumDia / nBpSamples : 0;
+        finalRR   = estimateRespRate(finalHr);
 
         Serial.printf("RESULT: HR %.0f | SpO2 %.0f | BP %.0f/%.0f (%d samples, %.1fs)\n",
                       finalHr, finalSpo2, finalSys, finalDia, nSamples,
@@ -484,6 +561,7 @@ void loop() {
         restartEstimation();  // สำคัญ: ไม่ restart แล้ว hub จะไม่ส่ง sample อีก = จอค้างรอบสอง
         needRelease = true;   // กันวัดวนซ้ำทั้งที่นิ้วยังวางอยู่
         lastUpdate = 0;       // บังคับ home วาดค่าใหม่ทันที
+        resultShownAt = millis(); // เริ่มนับเวลาค้างจอผลลัพธ์
         state = CLOCK_MODE;
       } else if (millis() - detectStart >= SCAN_MAX_MS) {
         // สัญญาณแย่จนเก็บไม่ครบในเวลาเพดาน = fail ไม่โชว์ค่ามั่ว
