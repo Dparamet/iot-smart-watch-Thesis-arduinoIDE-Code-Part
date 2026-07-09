@@ -45,8 +45,10 @@
 #define C_WARN  0xFFE0
 
 // -------- SCAN TUNING --------
-#define SCAN_TARGET_SAMPLES 100    // valid sample ครบเท่านี้ = 100% (progress ผูกกับ detect จริง)
-#define SCAN_MAX_MS       30000UL  // เพดานเวลา ถ้าสัญญาณหลุดบ่อยจนไม่ครบใน 30 วิ = fail
+// เซ็นเซอร์ให้ค่า valid ~2 ตัว/วินาที -> 20 ตัว = ~10 วิ (เพดาน 40 วิ กันสัญญาณหลุดบ่อย)
+// อย่าตั้ง TARGET สูงกว่าที่เก็บได้ทันในเพดาน ไม่งั้นสแกนจะ FAIL ตลอด จอเลยไม่โชว์ค่า
+#define SCAN_TARGET_SAMPLES 20     // valid sample ครบเท่านี้ = 100% (progress ผูกกับ detect จริง)
+#define SCAN_MAX_MS       40000UL  // เพดานเวลา ถ้าเก็บไม่ครบใน 40 วิ = fail
 #define FINGER_LOST_MS    1500UL   // ยกนิ้วต่อเนื่องเกินนี้ = ยกเลิกสแกน กลับหน้าหลัก
 
 // -------- OBJECT --------
@@ -237,7 +239,7 @@ void drawHome() {
   if (homeFullDraw) {
     homeFullDraw = false;
     lastBatShown = -2;
-    lastMinShown = -1;
+    lastMinShown = -2; // -2 = ยังไม่วาดเวลาเลย (ต่างจาก key=-1 ตอน NTP ยังไม่ sync)
     gfx->fillScreen(C_BLACK);
 
     // กรอบไอคอนแบต (คงที่)
@@ -280,16 +282,15 @@ void drawHome() {
     gfx->fillRect(152, 22, fw, 10, bc);
   }
 
-  // ---- เวลา: อัปเดตเฉพาะตอนเปลี่ยน ----
+  // ---- เวลา HH:MM จริงจาก NTP ----
   struct tm t;
   int key;
-  if (wifiOk && getLocalTime(&t, 0)) {
+  if (getLocalTime(&t, 0)) {                          // sync แล้ว -> เวลาจริง
     sprintf(buf, "%02d:%02d", t.tm_hour, t.tm_min);
     key = t.tm_hour * 60 + t.tm_min;
-  } else {
-    unsigned long s = millis() / 1000;               // offline: นับจากเปิดเครื่อง
-    sprintf(buf, "%02lu:%02lu", (s / 60) % 60, s % 60);
-    key = (int)s;
+  } else {                                            // ยังไม่ sync (รอเน็ต) -> รอ
+    strcpy(buf, "--:--");
+    key = -1;
   }
   if (key != lastMinShown) {
     lastMinShown = key;
@@ -459,7 +460,11 @@ void loop() {
       // sample หลุดบ้าง (เช่น 7/10) ไม่เป็นไร progress หยุดรอแล้วไปต่อจนครบ 100%
       if (valid) {
         sumHr += hr; sumSpo2 += spo2; nSamples++;
-        if (sys > 0 && dia > 0) { sumSys += sys; sumDia += dia; nBpSamples++; }
+      }
+      // BP เก็บแยก: sensor จ่ายมาเมื่อไหร่เก็บเมื่อนั้น (ไม่ผูกกับ valid ของ HR/SpO2)
+      // BP ต้อง calibrate สำเร็จก่อน sensor ถึงจะจ่ายค่า ไม่มีก็ปล่อย --/-- (optional)
+      if (fingerOn && sys > 0 && dia > 0) {
+        sumSys += sys; sumDia += dia; nBpSamples++;
       }
 
       showDetecting(hr, spo2, valid);
