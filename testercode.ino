@@ -26,9 +26,11 @@
 // -------- WIFI / DASHBOARD --------
 // ไม่ hardcode SSID/password แล้ว — ใช้ WiFiManager ให้ผู้ใช้ตั้งค่าเองผ่านหน้าเว็บตอนบูตครั้งแรก (บันทึกลง flash เอง)
 #define WIFI_MANAGER_AP_NAME         "SmartWatch-Setup"  // ชื่อ AP ตอนเปิดหน้าตั้งค่า WiFi
+#define WIFI_MANAGER_AP_PASSWORD     "watch1234"          // รหัสผ่าน AP ตั้งค่า (ต้อง >=8 ตัว) กันคนแปลกหน้าเข้ามาแก้ WiFi/ดักข้อมูล เปลี่ยนได้ตามต้องการ
 #define WIFI_CONFIG_PORTAL_TIMEOUT_S 180UL                // ปิด portal เองถ้าไม่มีใครตั้งค่าใน 3 นาที (กันเปิดค้างกินแบต)
 #define BOOT_BTN_PIN                 9                    // ปุ่ม BOOT บนบอร์ด XIAO ESP32C3 (active LOW) กดค้างตอนเปิดเครื่อง = ลืม WiFi เดิม
-#define API_URL       "http://YOUR_DASHBOARD_HOST/api/vitals"  // แก้เป็น endpoint ของ dashboard
+#define API_URL       "http://172.24.155.96:8000/api/iot/vitals/"  // แก้เป็น endpoint ของ dashboard
+#define API_KEY       "DufwFwDIRjwFa6LvdwA7PmF3pg4CgA6C"  // ส่งผ่าน header X-API-Key
 #define DEVICE_NAME   "smartwatch-01"
 
 // -------- TIME / BATTERY --------
@@ -70,7 +72,6 @@ enum State {
 };
 
 State state = CLOCK_MODE;
-State lastState = DETECTING; // ตั้งให้ต่างกันไว้ เพื่อบังคับเคลียร์จอรอบแรก
 bool needRelease = false;    // วัดเสร็จต้องยกนิ้วก่อน ถึงจะเริ่มสแกนใหม่ได้
 
 // home render state: วาดหน้าทีละช่อง กันจอกระพริบ (ไม่ fillScreen ทั้งจอทุกวิ)
@@ -85,6 +86,7 @@ unsigned long fingerLostAt = 0;   // เวลาที่นิ้วหลุ�
 unsigned long fingerOffSince = 0; // debounce ตอนรอ "ยกนิ้ว" กันหลุดหลอกหลัง restartEstimation()
 #define RELEASE_DEBOUNCE_MS 400UL // ต้องไม่มีนิ้วต่อเนื่องเกินนี้ ถึงถือว่ายกนิ้วจริง
 unsigned long resultShownAt = 0;  // เวลาที่เพิ่งวาดผลวัดล่าสุดบนหน้า home
+int lastStatusKey = -999;         // สถานะแถบล่างจอที่วาดล่าสุด (กันวาดซ้ำ)
 #define MIN_HOME_HOLD_MS 3000UL   // การันตีค่าที่วัดได้ค้างจออย่างน้อยเท่านี้ ไม่ว่าจะมีอะไรมาทำให้สแกนใหม่ก่อนก็ตาม
 
 float finalHr = 0, finalSpo2 = 0, finalSys = 0, finalDia = 0, finalRR = 0;
@@ -92,7 +94,6 @@ float finalHr = 0, finalSpo2 = 0, finalSys = 0, finalDia = 0, finalRR = 0;
 // ตัวสะสมค่าเฉลี่ยระหว่างสแกน
 float sumHr = 0, sumSpo2 = 0, sumSys = 0, sumDia = 0;
 int   nSamples = 0, nBpSamples = 0;
-int   lastPctDrawn = -1;
 
 static uint8_t calibVec[824];
 static size_t  calibLen = 0;
@@ -214,13 +215,15 @@ void connectWiFi() {
   }
 
   gfx->fillScreen(C_BLACK);
-  drawCenter("WIFI SETUP", 70, 2, C_WARN);
-  drawCenter("Connect phone to:", 110, 1, C_WHITE);
-  drawCenter(WIFI_MANAGER_AP_NAME, 130, 2, C_CYAN);
-  drawCenter("then open 192.168.4.1", 160, 1, C_GRAY);
-  drawCenter("(skip if already set up)", 180, 1, C_GRAY);
+  drawCenter("WIFI SETUP", 60, 2, C_WARN);
+  drawCenter("Connect phone to:", 95, 1, C_WHITE);
+  drawCenter(WIFI_MANAGER_AP_NAME, 115, 2, C_CYAN);
+  drawCenter("AP password:", 145, 1, C_WHITE);
+  drawCenter(WIFI_MANAGER_AP_PASSWORD, 160, 1, C_CYAN);
+  drawCenter("then open 192.168.4.1", 180, 1, C_GRAY);
+  drawCenter("(skip if already set up)", 195, 1, C_GRAY);
 
-  wifiOk = wm.autoConnect(WIFI_MANAGER_AP_NAME);
+  wifiOk = wm.autoConnect(WIFI_MANAGER_AP_NAME, WIFI_MANAGER_AP_PASSWORD);
 
   if (wifiOk) {
     Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
@@ -253,9 +256,11 @@ bool getIsoTimestamp(char *buf, size_t len) {
   return true;
 }
 
-// ส่งผลวัดขึ้น dashboard: {"device_id":"...","heart_rate":72,"spo2":98,"respiratory_rate":18,"blood_pressure_sys":120,"blood_pressure_dia":80,"timestamp":"..."}
+// ส่งผลวัดขึ้น dashboard: {"device_id":"...","heart_rate":72,"spo2":98,"respiratory_rate":18,"blood_pressure_sys":120,"blood_pressure_dia":80,"sample_count":20,"partial":false,"timestamp":"..."}
 // ไม่ส่ง patient_id (dashboard ผูก device_id กับผู้ป่วยเอง) และไม่ส่ง temperature (เซนเซอร์นี้วัดไม่ได้ และไม่มีสูตรคำนวณที่น่าเชื่อถือ)
-bool sendVitals(float hr, float spo2, float sys, float dia) {
+// sampleCount < SCAN_TARGET_SAMPLES = ส่งมาแม้ scan "fail" (เก็บ sample ไม่ครบ) เพื่อให้เทส API pipeline ได้แม้สแกนไม่สมบูรณ์
+// "partial":true บอก backend/dashboard ว่าค่านี้ความเชื่อถือได้ต่ำกว่าปกติ ไม่ใช่ผลวัดที่ครบสมบูรณ์
+bool sendVitals(float hr, float spo2, float sys, float dia, int sampleCount) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Send skipped: no WiFi");
     return false;
@@ -264,11 +269,12 @@ bool sendVitals(float hr, float spo2, float sys, float dia) {
   float rr = estimateRespRate(hr);
   char ts[24];
   bool haveTs = getIsoTimestamp(ts, sizeof(ts));
+  bool partial = sampleCount < SCAN_TARGET_SAMPLES;
 
-  char json[224];
+  char json[256];
   int n = snprintf(json, sizeof(json),
-    "{\"device_id\":\"%s\",\"heart_rate\":%d,\"spo2\":%d,\"respiratory_rate\":%d",
-    DEVICE_NAME, (int)hr, (int)spo2, (int)rr);
+    "{\"device_id\":\"%s\",\"heart_rate\":%d,\"spo2\":%d,\"respiratory_rate\":%d,\"sample_count\":%d,\"partial\":%s",
+    DEVICE_NAME, (int)hr, (int)spo2, (int)rr, sampleCount, partial ? "true" : "false");
   if (sys > 0 && dia > 0) {
     // BP เป็น optional — ไม่มีค่าก็ไม่ส่ง field
     n += snprintf(json + n, sizeof(json) - n,
@@ -282,6 +288,7 @@ bool sendVitals(float hr, float spo2, float sys, float dia) {
   HTTPClient http;
   http.begin(API_URL);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", API_KEY);
   http.setTimeout(3000); // อย่าค้างนานเกิน จอจะ freeze
   int code = http.POST(json);
   http.end();
@@ -291,16 +298,17 @@ bool sendVitals(float hr, float spo2, float sys, float dia) {
 }
 
 // -------- MAIN APP UI --------
-// หน้าเดียวจบ: แบต + เวลาจริง + HR/SpO2/BP (ตาม mind board)
-// วาดทีละช่อง ลบเฉพาะกล่องที่เปลี่ยน -> จอนิ่ง ไม่กระพริบ ไม่มีเงาของเก่า
+// หน้าเดียวจบ ไม่มีหน้า SCANNING แยกแล้ว: แบต + เวลาจริง + HR/SpO2/BP/RR + แถบสถานะล่างสุด
+// ที่เปลี่ยนไปตามว่ากำลังวัดอยู่ไหม (progress %) วาดทีละช่อง ลบเฉพาะกล่องที่เปลี่ยน -> จอนิ่ง ไม่กระพริบ
 void drawHome() {
   char buf[24];
 
-  // ---- วาดทั้งหน้าครั้งเดียว: กรอบไอคอนแบต + vitals + prompt ----
+  // ---- วาดทั้งหน้าครั้งเดียว: กรอบไอคอนแบต + vitals ----
   if (homeFullDraw) {
     homeFullDraw = false;
     lastBatShown = -2;
     lastMinShown = -2; // -2 = ยังไม่วาดเวลาเลย (ต่างจาก key=-1 ตอน NTP ยังไม่ sync)
+    lastStatusKey = -999; // บังคับวาดแถบสถานะใหม่ด้วย
     gfx->fillScreen(C_BLACK);
 
     // กรอบไอคอนแบต (คงที่)
@@ -324,107 +332,112 @@ void drawHome() {
     if (finalRR > 0) sprintf(buf, "RR ~ : %d", (int)finalRR);
     else              strcpy(buf, "RR ~ : --");
     drawCenter(buf, 180, 2, C_WARN);
-
-    drawCenter("Place finger to scan", 205, 1, C_GRAY);
-  } else if (millis() - lastUpdate < 1000) {
-    return; // อัปเดตช่องที่เปลี่ยนวินาทีละครั้งพอ
-  }
-  lastUpdate = millis();
-
-  // ---- แบต: อัปเดตเฉพาะตอน % เปลี่ยน ----
-  int bat = readBatteryPct();
-  if (bat != lastBatShown) {
-    lastBatShown = bat;
-    if (bat >= 0) sprintf(buf, "%d%%", bat);
-    else          strcpy(buf, "--%");
-    gfx->fillRect(80, 20, 65, 16, C_BLACK);          // ลบเลข % เก่า
-    gfx->setTextSize(2);
-    gfx->setTextColor(C_WHITE);
-    gfx->setCursor(145 - (int)strlen(buf) * 12, 20); // ชิดขวาติดไอคอน
-    gfx->print(buf);
-    int fw = (bat >= 0 ? bat : 100) * 22 / 100;      // -1 = โชว์เต็มสีเทา
-    uint16_t bc = (bat < 0) ? C_GRAY : (bat > 30 ? C_GREEN : C_RED);
-    gfx->fillRect(152, 22, 22, 10, C_BLACK);         // ลบไส้เก่า
-    gfx->fillRect(152, 22, fw, 10, bc);
   }
 
-  // ---- เวลา HH:MM จริงจาก NTP ----
-  struct tm t;
+  // ---- แบต + เวลา: throttle วินาทีละครั้งพอ (ไม่ต้องเร็วกว่านี้) ----
+  if (millis() - lastUpdate >= 1000) {
+    lastUpdate = millis();
+
+    int bat = readBatteryPct();
+    if (bat != lastBatShown) {
+      lastBatShown = bat;
+      if (bat >= 0) sprintf(buf, "%d%%", bat);
+      else          strcpy(buf, "--%");
+      gfx->fillRect(80, 20, 65, 16, C_BLACK);          // ลบเลข % เก่า
+      gfx->setTextSize(2);
+      gfx->setTextColor(C_WHITE);
+      gfx->setCursor(145 - (int)strlen(buf) * 12, 20); // ชิดขวาติดไอคอน
+      gfx->print(buf);
+      int fw = (bat >= 0 ? bat : 100) * 22 / 100;      // -1 = โชว์เต็มสีเทา
+      uint16_t bc = (bat < 0) ? C_GRAY : (bat > 30 ? C_GREEN : C_RED);
+      gfx->fillRect(152, 22, 22, 10, C_BLACK);         // ลบไส้เก่า
+      gfx->fillRect(152, 22, fw, 10, bc);
+    }
+
+    struct tm t;
+    int key;
+    if (getLocalTime(&t, 0)) {                          // sync แล้ว -> เวลาจริง
+      sprintf(buf, "%02d:%02d", t.tm_hour, t.tm_min);
+      key = t.tm_hour * 60 + t.tm_min;
+    } else {                                            // ยังไม่ sync (รอเน็ต) -> รอ
+      strcpy(buf, "--:--");
+      key = -1;
+    }
+    if (key != lastMinShown) {
+      lastMinShown = key;
+      gfx->fillRect(0, 60, 240, 40, C_BLACK);          // ลบเวลาเก่า (เฉพาะแถบนี้)
+      drawCenter(buf, 60, 5, C_WHITE);
+    }
+  }
+
+  drawStatusLine(); // อัปเดตทุกครั้งที่เรียก (ไม่ throttle) progress % ต้องขยับทันที ไม่รอ 1 วิ
+}
+
+// แถบสถานะล่างจอ home: 3 สถานะ — "Scanning... NN%" ตอนวัด, "Lift finger" ตอนวัดเสร็จแต่นิ้วยังวางค้าง
+// (needRelease ค้าง = ไม่ยอมเริ่มรอบใหม่จนกว่าจะยกนิ้ว ถ้าไม่บอกผู้ใช้จะค้างแบบงงๆ), "Place finger" ตอนว่างจริง
+// แทนที่หน้า SCANNING แยกทั้งหน้าแบบเดิม กันจอวูบวาบ + เห็นค่า HR/SpO2/BP/RR เดิมตลอดเวลาแม้กำลังวัดรอบใหม่
+void drawStatusLine() {
+  int pct = 0;
   int key;
-  if (getLocalTime(&t, 0)) {                          // sync แล้ว -> เวลาจริง
-    sprintf(buf, "%02d:%02d", t.tm_hour, t.tm_min);
-    key = t.tm_hour * 60 + t.tm_min;
-  } else {                                            // ยังไม่ sync (รอเน็ต) -> รอ
-    strcpy(buf, "--:--");
-    key = -1;
-  }
-  if (key != lastMinShown) {
-    lastMinShown = key;
-    gfx->fillRect(0, 60, 240, 40, C_BLACK);          // ลบเวลาเก่า (เฉพาะแถบนี้)
-    drawCenter(buf, 60, 5, C_WHITE);
-  }
-}
-
-bool lastSignalDrawn = true;
-
-void showDetecting(float hr, float spo2, bool haveSignal) {
-  // progress = จำนวน valid sample จริง ไม่ใช่เวลา -> สัญญาณหลุด progress จะหยุดรอ ไม่วิ่งมั่ว
-  int pct = nSamples * 100 / SCAN_TARGET_SAMPLES;
-  if (pct > 100) pct = 100;
-  // วาดเฉพาะตอน % หรือสถานะสัญญาณเปลี่ยน กันจอกะพริบ
-  if (pct == lastPctDrawn && haveSignal == lastSignalDrawn) return;
-  lastPctDrawn = pct;
-  lastSignalDrawn = haveSignal;
-
-  gfx->fillScreen(C_BLACK);
-  drawCenter("SCANNING", 55, 3, C_GREEN);
-
-  char buf[24];
-  sprintf(buf, "%d%%", pct);
-  drawCenter(buf, 100, 4, C_WHITE);
-
-  // progress bar
-  gfx->drawRect(45, 145, 150, 12, C_GRAY);
-  gfx->fillRect(47, 147, (146 * pct) / 100, 8, C_GREEN);
-
-  // ค่าดิบระหว่างสแกน (live preview)
-  if (haveSignal) {
-    sprintf(buf, "HR %d  SpO2 %d%%", (int)hr, (int)spo2);
-    drawCenter(buf, 172, 1, C_CYAN);
+  if (state == DETECTING) {
+    pct = nSamples * 100 / SCAN_TARGET_SAMPLES;
+    if (pct > 100) pct = 100;
+    key = 1000 + pct;
+  } else if (needRelease) {
+    key = 2;
   } else {
-    drawCenter("Weak signal, hold on...", 172, 1, C_WARN);
+    key = 0;
   }
-  drawCenter("Keep finger still", 195, 1, C_GRAY);
-}
+  if (key == lastStatusKey) return; // ไม่เปลี่ยน ไม่ต้องวาดซ้ำ กันกระพริบ
+  lastStatusKey = key;
 
-void showScanFail() {
-  gfx->fillScreen(C_BLACK);
-  drawCenter("SCAN FAILED", 95, 2, C_RED);
-  drawCenter("Weak signal, try again", 130, 1, C_WARN);
-}
+  gfx->fillRect(0, 200, 240, 30, C_BLACK); // ลบเฉพาะแถบสถานะ ไม่แตะ vitals ด้านบน
 
-void showNotFound() {
-  gfx->fillScreen(C_BLACK);
-  drawCenter("NOT FOUND", 95, 2, C_RED);
-  drawCenter("Please try again", 130, 1, C_WARN);
+  if (state == DETECTING) {
+    char buf[20];
+    sprintf(buf, "Scanning... %d%%", pct);
+    drawCenter(buf, 203, 1, C_GREEN);
+    gfx->drawRect(60, 220, 120, 8, C_GRAY);
+    gfx->fillRect(61, 221, (118 * pct) / 100, 6, C_GREEN);
+  } else if (needRelease) {
+    drawCenter("Done! Lift finger to rescan", 205, 1, C_WARN);
+  } else {
+    drawCenter("Place finger to scan", 205, 1, C_GRAY);
+  }
 }
 
 // -------- SCAN HELPERS --------
 void resetScan() {
   sumHr = sumSpo2 = sumSys = sumDia = 0;
   nSamples = nBpSamples = 0;
-  lastPctDrawn = -1;
-  lastSignalDrawn = true;
   fingerLostAt = 0;
 }
 
-// จบ/ยกเลิกสแกน -> โชว์ข้อความ + restart sensor + กลับหน้าหลัก
-void abortScan(void (*screen)()) {
-  screen();
-  restartEstimation(); // ทำระหว่างโชว์ข้อความ ไม่เสียเวลาเพิ่ม
-  delay(2000);
-  needRelease = true;  // ต้องยกนิ้วก่อนถึงเริ่มรอบใหม่ กันสแกนวนเองตอนสัญญาณแย่
-  lastUpdate = 0;
+// จบสแกน ไม่ว่าจะเก็บครบเป้าหรือหมดเวลา/นิ้วหลุดก่อน -> สรุปผลเท่าที่เก็บได้แล้วส่ง API
+// ส่งแม้ sample ไม่ครบ (nSamples < SCAN_TARGET_SAMPLES) เพื่อให้เทส API pipeline ได้แม้สแกนไม่สมบูรณ์
+// (field "partial":true ใน JSON บอก backend ว่าค่านี้ความเชื่อถือได้ต่ำกว่าปกติ)
+void finishScan() {
+  if (nSamples > 0) {
+    finalHr   = sumHr / nSamples;
+    finalSpo2 = sumSpo2 / nSamples;
+    finalSys  = nBpSamples ? sumSys / nBpSamples : 0;
+    finalDia  = nBpSamples ? sumDia / nBpSamples : 0;
+    finalRR   = estimateRespRate(finalHr);
+
+    Serial.printf("%s: HR %.0f | SpO2 %.0f | BP %.0f/%.0f (%d/%d samples, %.1fs)\n",
+                  nSamples >= SCAN_TARGET_SAMPLES ? "RESULT" : "PARTIAL(FAIL)",
+                  finalHr, finalSpo2, finalSys, finalDia, nSamples, SCAN_TARGET_SAMPLES,
+                  (millis() - detectStart) / 1000.0);
+
+    dataSent = sendVitals(finalHr, finalSpo2, finalSys, finalDia, nSamples);
+  } else {
+    Serial.println("Scan failed: 0 valid samples, nothing to send");
+  }
+
+  restartEstimation();  // สำคัญ: ไม่ restart แล้ว hub จะไม่ส่ง sample อีก = จอค้างรอบสอง
+  needRelease = true;   // กันวัดวนซ้ำทั้งที่นิ้วยังวางอยู่
+  resultShownAt = millis(); // เริ่มนับเวลาค้างจอผลลัพธ์
+  homeFullDraw = true;  // วาดค่าใหม่ + เคลียร์แถบสถานะกลับเป็น idle ทันที
   state = CLOCK_MODE;
 }
 
@@ -485,15 +498,8 @@ void loop() {
                   hr, spo2, sys, dia, fingerOn ? "ON" : "OFF", valid ? "Y" : "N");
   }
 
-  // เปลี่ยนสเตท -> เข้า home ให้วาดทั้งหน้าใหม่, เข้า scan ให้ล้างจอ
-  if (state != lastState) {
-    lastState = state;
-    if (state == CLOCK_MODE) homeFullDraw = true; // drawHome จะ fillScreen เอง
-    else                     gfx->fillScreen(C_BLACK);
-    lastUpdate = 0;
-  }
-
   // -------- STATE MACHINE --------
+  // ไม่มีหน้า SCANNING แยกแล้ว — ทั้งสอง state วาดผ่าน drawHome() เดียวกันเสมอ (สถานะเปลี่ยนแค่แถบล่างจอ)
   switch (state) {
 
     case CLOCK_MODE:
@@ -518,7 +524,7 @@ void loop() {
       break;
 
     case DETECTING: {
-      // debug: นิ้วหลุดต่อเนื่องเกินกำหนด -> ยกเลิก กลับหน้าหลัก
+      // debug: นิ้วหลุดต่อเนื่องเกินกำหนด -> จบสแกน (ส่งผลเท่าที่เก็บได้) กลับหน้าหลัก
       if (haveSample) {
         if (fingerOn) {
           fingerLostAt = 0;
@@ -527,8 +533,8 @@ void loop() {
         }
       }
       if (fingerLostAt && millis() - fingerLostAt > FINGER_LOST_MS) {
-        Serial.println("Finger removed -> NOT FOUND -> home");
-        abortScan(showNotFound);
+        Serial.println("Finger removed early");
+        finishScan();
         break;
       }
 
@@ -543,31 +549,16 @@ void loop() {
         sumSys += sys; sumDia += dia; nBpSamples++;
       }
 
-      showDetecting(hr, spo2, valid);
+      drawHome(); // อัปเดตแถบสถานะ/progress % บนหน้า home เดิม ไม่สลับหน้า
 
-      // เก็บ valid sample ครบเป้า = 100% -> สรุปผลทันที
+      // เก็บ valid sample ครบเป้า = 100% -> จบสแกนสำเร็จ
       if (nSamples >= SCAN_TARGET_SAMPLES) {
-        finalHr   = sumHr / nSamples;
-        finalSpo2 = sumSpo2 / nSamples;
-        finalSys  = nBpSamples ? sumSys / nBpSamples : 0;
-        finalDia  = nBpSamples ? sumDia / nBpSamples : 0;
-        finalRR   = estimateRespRate(finalHr);
-
-        Serial.printf("RESULT: HR %.0f | SpO2 %.0f | BP %.0f/%.0f (%d samples, %.1fs)\n",
-                      finalHr, finalSpo2, finalSys, finalDia, nSamples,
-                      (millis() - detectStart) / 1000.0);
-
-        dataSent = sendVitals(finalHr, finalSpo2, finalSys, finalDia);
-        restartEstimation();  // สำคัญ: ไม่ restart แล้ว hub จะไม่ส่ง sample อีก = จอค้างรอบสอง
-        needRelease = true;   // กันวัดวนซ้ำทั้งที่นิ้วยังวางอยู่
-        lastUpdate = 0;       // บังคับ home วาดค่าใหม่ทันที
-        resultShownAt = millis(); // เริ่มนับเวลาค้างจอผลลัพธ์
-        state = CLOCK_MODE;
+        finishScan();
       } else if (millis() - detectStart >= SCAN_MAX_MS) {
-        // สัญญาณแย่จนเก็บไม่ครบในเวลาเพดาน = fail ไม่โชว์ค่ามั่ว
-        Serial.printf("Scan failed: only %d/%d valid samples in %lus\n",
+        // สัญญาณแย่จนเก็บไม่ครบในเวลาเพดาน = fail แต่ยังส่งผลเท่าที่เก็บได้ขึ้น API เพื่อเทส pipeline
+        Serial.printf("Scan timeout: only %d/%d valid samples in %lus\n",
                       nSamples, SCAN_TARGET_SAMPLES, SCAN_MAX_MS / 1000);
-        abortScan(showScanFail);
+        finishScan();
       }
       break;
     }
