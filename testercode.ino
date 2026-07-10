@@ -226,6 +226,8 @@ void connectWiFi() {
   wifiOk = wm.autoConnect(WIFI_MANAGER_AP_NAME, WIFI_MANAGER_AP_PASSWORD);
 
   if (wifiOk) {
+    WiFi.setAutoReconnect(true); // เน็ตหลุดแล้วต่อเองเบื้องหลัง ไม่งั้นหลุดครั้งเดียว = ส่ง API ไม่ได้อีกเลยจนรีบูต
+    WiFi.setSleep(false);        // set ซ้ำหลัง autoConnect เพราะ WiFiManager อาจ reset โหมดระหว่าง portal
     Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
     configTime(TZ_OFFSET_SEC, 0, NTP_SERVER); // เวลาจริงจาก NTP sync เองเบื้องหลัง
   } else {
@@ -261,9 +263,15 @@ bool getIsoTimestamp(char *buf, size_t len) {
 // sampleCount < SCAN_TARGET_SAMPLES = ส่งมาแม้ scan "fail" (เก็บ sample ไม่ครบ) เพื่อให้เทส API pipeline ได้แม้สแกนไม่สมบูรณ์
 // "partial":true บอก backend/dashboard ว่าค่านี้ความเชื่อถือได้ต่ำกว่าปกติ ไม่ใช่ผลวัดที่ครบสมบูรณ์
 bool sendVitals(float hr, float spo2, float sys, float dia, int sampleCount) {
+  // เน็ตหลุดชั่วขณะเป็นเรื่องปกติ — ลอง reconnect แล้วรอสั้นๆ ก่อนยอมแพ้ (บล็อกจอสูงสุด ~4 วิ เฉพาะตอนหลุดจริง)
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Send skipped: no WiFi");
-    return false;
+    Serial.println("WiFi down -> reconnecting...");
+    WiFi.reconnect();
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(200);
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Send skipped: no WiFi");
+      return false;
+    }
   }
 
   float rr = estimateRespRate(hr);
@@ -285,16 +293,26 @@ bool sendVitals(float hr, float spo2, float sys, float dia, int sampleCount) {
   }
   snprintf(json + n, sizeof(json) - n, "}");
 
-  HTTPClient http;
-  http.begin(API_URL);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", API_KEY);
-  http.setTimeout(3000); // อย่าค้างนานเกิน จอจะ freeze
-  int code = http.POST(json);
-  http.end();
+  // ลอง 2 รอบ: timeout/หลุดชั่วขณะรอบแรกไม่ควรทำให้ผลวัดหายทั้งรอบ
+  int code = -1;
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    HTTPClient http;
+    http.begin(API_URL);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", API_KEY);
+    http.setConnectTimeout(3000);
+    http.setTimeout(5000); // 3000 เดิมสั้นไปสำหรับ backend ที่ตอบช้า ทำให้ fail ทั้งที่ server ได้รับแล้ว
+    code = http.POST(json);
+    http.end();
 
-  Serial.printf("POST %s -> %d : %s\n", API_URL, code, json);
-  return code >= 200 && code < 300;
+    // code < 0 = error ฝั่ง client (ต่อไม่ติด/timeout) — errorToString บอกสาเหตุจริง
+    Serial.printf("POST attempt %d -> %d%s : %s\n", attempt, code,
+                  code < 0 ? (String(" (") + HTTPClient::errorToString(code) + ")").c_str() : "",
+                  json);
+    if (code >= 200 && code < 300) return true;
+    if (attempt == 1) delay(500);
+  }
+  return false;
 }
 
 // -------- MAIN APP UI --------
