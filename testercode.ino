@@ -29,9 +29,10 @@
 #define WIFI_MANAGER_AP_PASSWORD     "watch1234"          // รหัสผ่าน AP ตั้งค่า (ต้อง >=8 ตัว) กันคนแปลกหน้าเข้ามาแก้ WiFi/ดักข้อมูล เปลี่ยนได้ตามต้องการ
 #define WIFI_CONFIG_PORTAL_TIMEOUT_S 180UL                // ปิด portal เองถ้าไม่มีใครตั้งค่าใน 3 นาที (กันเปิดค้างกินแบต)
 #define BOOT_BTN_PIN                 9                    // ปุ่ม BOOT บนบอร์ด XIAO ESP32C3 (active LOW) กดค้างตอนเปิดเครื่อง = ลืม WiFi เดิม
-#define API_URL       "http://172.24.155.96:8000/api/iot/vitals/"  // แก้เป็น endpoint ของ dashboard
+#define API_URL       "http://172.24.155.69:8000/api/iot/vitals/"  // แก้เป็น endpoint ของ dashboard
 #define API_KEY       "DufwFwDIRjwFa6LvdwA7PmF3pg4CgA6C"  // ส่งผ่าน header X-API-Key
-#define DEVICE_NAME   "smartwatch-01"
+#define DEVICE_NAME   "WT001"
+#define TEMPERATURE_C 36.5f  // backend บังคับส่ง แต่เซนเซอร์นี้วัดอุณหภูมิไม่ได้ — ส่งค่าคงที่ไปก่อน ถ้าต่อ MLX90614 เมื่อไหร่ค่อยเปลี่ยนเป็นค่าวัดจริง
 
 // -------- TIME / BATTERY --------
 #define TZ_OFFSET_SEC (7 * 3600)  // ไทย GMT+7
@@ -53,7 +54,8 @@
 // เซ็นเซอร์ให้ค่า valid ~2 ตัว/วินาที -> 20 ตัว = ~10 วิ (เพดาน 40 วิ กันสัญญาณหลุดบ่อย)
 // อย่าตั้ง TARGET สูงกว่าที่เก็บได้ทันในเพดาน ไม่งั้นสแกนจะ FAIL ตลอด จอเลยไม่โชว์ค่า
 #define SCAN_TARGET_SAMPLES 20     // valid sample ครบเท่านี้ = 100% (progress ผูกกับ detect จริง)
-#define SCAN_MAX_MS       40000UL  // เพดานเวลา ถ้าเก็บไม่ครบใน 40 วิ = fail
+#define SPO2_MIN_SAMPLES    3      // HR ครบแล้วยังรอ SpO2 ให้ได้อย่างน้อยเท่านี้ก่อนจบรอบ (SpO2 มาช้ากว่า HR มาก)
+#define SCAN_MAX_MS       40000UL  // เพดานเวลา ถ้าเก็บไม่ครบใน 40 วิ = fail (รวมเวลารอ SpO2 ด้วย)
 #define FINGER_LOST_MS    1500UL   // ยกนิ้วต่อเนื่องเกินนี้ = ยกเลิกสแกน กลับหน้าหลัก
 
 // -------- OBJECT --------
@@ -92,14 +94,16 @@ int lastStatusKey = -999;         // สถานะแถบล่างจอ�
 float finalHr = 0, finalSpo2 = 0, finalSys = 0, finalDia = 0, finalRR = 0;
 
 // ตัวสะสมค่าเฉลี่ยระหว่างสแกน
+// HR กับ SpO2 นับแยกกัน: sensor รายงานมาคนละจังหวะ (spo2ReportFlag แยกจาก HR)
+// sample ที่ HR valid มักได้ SpO2=0 และกลับกัน ถ้าเช็ครวมจะได้ค่าแค่ฝั่งเดียวเสมอ
 float sumHr = 0, sumSpo2 = 0, sumSys = 0, sumDia = 0;
-int   nSamples = 0, nBpSamples = 0;
+int   nSamples = 0, nSpo2Samples = 0, nBpSamples = 0;
 
 static uint8_t calibVec[824];
 static size_t  calibLen = 0;
 
 bool wifiOk = false;
-bool dataSent = false;
+int lastSendStatus = -1; // -1 ยังไม่เคยส่ง, 0 ส่ง fail, 1 ส่งสำเร็จ — โชว์เป็นจุดสีบนจอ
 
 // -------- UI HELPER --------
 void drawCenter(const char* txt, int y, int size, uint16_t color) {
@@ -258,8 +262,8 @@ bool getIsoTimestamp(char *buf, size_t len) {
   return true;
 }
 
-// ส่งผลวัดขึ้น dashboard: {"device_id":"...","heart_rate":72,"spo2":98,"respiratory_rate":18,"blood_pressure_sys":120,"blood_pressure_dia":80,"sample_count":20,"partial":false,"timestamp":"..."}
-// ไม่ส่ง patient_id (dashboard ผูก device_id กับผู้ป่วยเอง) และไม่ส่ง temperature (เซนเซอร์นี้วัดไม่ได้ และไม่มีสูตรคำนวณที่น่าเชื่อถือ)
+// ส่งผลวัดขึ้น dashboard: {"device_id":"...","temperature":36.5,"heart_rate":72,"spo2":98,...}
+// ไม่ส่ง patient_id — backend ผูก device_id กับผู้ป่วยเอง / temperature เป็น field บังคับ
 // sampleCount < SCAN_TARGET_SAMPLES = ส่งมาแม้ scan "fail" (เก็บ sample ไม่ครบ) เพื่อให้เทส API pipeline ได้แม้สแกนไม่สมบูรณ์
 // "partial":true บอก backend/dashboard ว่าค่านี้ความเชื่อถือได้ต่ำกว่าปกติ ไม่ใช่ผลวัดที่ครบสมบูรณ์
 bool sendVitals(float hr, float spo2, float sys, float dia, int sampleCount) {
@@ -274,15 +278,23 @@ bool sendVitals(float hr, float spo2, float sys, float dia, int sampleCount) {
     }
   }
 
-  float rr = estimateRespRate(hr);
   char ts[24];
   bool haveTs = getIsoTimestamp(ts, sizeof(ts));
   bool partial = sampleCount < SCAN_TARGET_SAMPLES;
 
-  char json[256];
+  // ทุก vital เป็น optional หมด — ส่ง 0 ไป backend จะโดน validation ตีกลับ 400
+  // รอบไหนวัดอะไรได้ก็ส่งอันนั้น (เช่น ได้แต่ SpO2 ก็ส่งแต่ SpO2)
+  char json[384];
   int n = snprintf(json, sizeof(json),
-    "{\"device_id\":\"%s\",\"heart_rate\":%d,\"spo2\":%d,\"respiratory_rate\":%d,\"sample_count\":%d,\"partial\":%s",
-    DEVICE_NAME, (int)hr, (int)spo2, (int)rr, sampleCount, partial ? "true" : "false");
+    "{\"device_id\":\"%s\",\"temperature\":%.1f,\"sample_count\":%d,\"partial\":%s",
+    DEVICE_NAME, TEMPERATURE_C, sampleCount, partial ? "true" : "false");
+  if (hr > 0) {
+    n += snprintf(json + n, sizeof(json) - n,
+      ",\"heart_rate\":%d,\"respiratory_rate\":%d", (int)hr, (int)estimateRespRate(hr));
+  }
+  if (spo2 > 0) {
+    n += snprintf(json + n, sizeof(json) - n, ",\"spo2\":%d", (int)spo2);
+  }
   if (sys > 0 && dia > 0) {
     // BP เป็น optional — ไม่มีค่าก็ไม่ส่ง field
     n += snprintf(json + n, sizeof(json) - n,
@@ -332,6 +344,9 @@ void drawHome() {
     // กรอบไอคอนแบต (คงที่)
     gfx->drawRect(150, 20, 26, 14, C_WHITE);
     gfx->fillRect(176, 24, 3, 6, C_WHITE);
+
+    // จุดสถานะ API รอบล่าสุด: เขียว=ส่งสำเร็จ แดง=fail เทา=ยังไม่เคยส่ง
+    gfx->fillCircle(66, 27, 5, lastSendStatus == 1 ? C_GREEN : lastSendStatus == 0 ? C_RED : C_GRAY);
 
     // vitals (เปลี่ยนเฉพาะหลังวัดเสร็จ -> วาดตรงนี้พอ)
     if (finalHr > 0) sprintf(buf, "HR   : %d", (int)finalHr);
@@ -427,7 +442,7 @@ void drawStatusLine() {
 // -------- SCAN HELPERS --------
 void resetScan() {
   sumHr = sumSpo2 = sumSys = sumDia = 0;
-  nSamples = nBpSamples = 0;
+  nSamples = nSpo2Samples = nBpSamples = 0;
   fingerLostAt = 0;
 }
 
@@ -435,25 +450,26 @@ void resetScan() {
 // ส่งแม้ sample ไม่ครบ (nSamples < SCAN_TARGET_SAMPLES) เพื่อให้เทส API pipeline ได้แม้สแกนไม่สมบูรณ์
 // (field "partial":true ใน JSON บอก backend ว่าค่านี้ความเชื่อถือได้ต่ำกว่าปกติ)
 void finishScan() {
-  if (nSamples > 0) {
-    finalHr   = sumHr / nSamples;
-    finalSpo2 = sumSpo2 / nSamples;
-    finalSys  = nBpSamples ? sumSys / nBpSamples : 0;
-    finalDia  = nBpSamples ? sumDia / nBpSamples : 0;
-    finalRR   = estimateRespRate(finalHr);
+  // แต่ละค่าเฉลี่ยจากตัวนับของตัวเอง — HR/SpO2 มาคนละจังหวะ นับรวมกันไม่ได้
+  if (nSamples > 0 || nSpo2Samples > 0) {
+    finalHr   = nSamples     ? sumHr / nSamples : 0;
+    finalSpo2 = nSpo2Samples ? sumSpo2 / nSpo2Samples : 0;
+    finalSys  = nBpSamples   ? sumSys / nBpSamples : 0;
+    finalDia  = nBpSamples   ? sumDia / nBpSamples : 0;
+    finalRR   = finalHr > 0  ? estimateRespRate(finalHr) : 0;
 
-    Serial.printf("%s: HR %.0f | SpO2 %.0f | BP %.0f/%.0f (%d/%d samples, %.1fs)\n",
+    Serial.printf("%s: HR %.0f (n=%d) | SpO2 %.0f (n=%d) | BP %.0f/%.0f (%d/%d samples, %.1fs)\n",
                   nSamples >= SCAN_TARGET_SAMPLES ? "RESULT" : "PARTIAL(FAIL)",
-                  finalHr, finalSpo2, finalSys, finalDia, nSamples, SCAN_TARGET_SAMPLES,
-                  (millis() - detectStart) / 1000.0);
+                  finalHr, nSamples, finalSpo2, nSpo2Samples, finalSys, finalDia,
+                  nSamples, SCAN_TARGET_SAMPLES, (millis() - detectStart) / 1000.0);
 
-    dataSent = sendVitals(finalHr, finalSpo2, finalSys, finalDia, nSamples);
+    lastSendStatus = sendVitals(finalHr, finalSpo2, finalSys, finalDia, nSamples) ? 1 : 0;
   } else {
     Serial.println("Scan failed: 0 valid samples, nothing to send");
   }
 
   restartEstimation();  // สำคัญ: ไม่ restart แล้ว hub จะไม่ส่ง sample อีก = จอค้างรอบสอง
-  needRelease = true;   // กันวัดวนซ้ำทั้งที่นิ้วยังวางอยู่
+  needRelease = false;  // วัดต่อเนื่อง: นิ้ววางค้างไว้ = เริ่มรอบใหม่เองหลังโชว์ผลครบ MIN_HOME_HOLD_MS แล้วส่ง API ทุกรอบ
   resultShownAt = millis(); // เริ่มนับเวลาค้างจอผลลัพธ์
   homeFullDraw = true;  // วาดค่าใหม่ + เคลียร์แถบสถานะกลับเป็น idle ทันที
   state = CLOCK_MODE;
@@ -496,7 +512,7 @@ void loop() {
   Max32664Sample sample;
   bool haveSample = false;
   bool fingerOn = false;
-  bool valid = false;
+  bool validHr = false, validSpo2 = false;
   float hr = 0, spo2 = 0, sys = 0, dia = 0;
 
   if (hub.readSample(sample) == Max32664Status::Ok) {
@@ -507,13 +523,15 @@ void loop() {
     dia = sample.diastolic;
 
     fingerOn = (sample.bpStatus != Max32664BpStatus::NoFinger);
-    // ค่าที่เชื่อถือได้จริง: มีนิ้ว + ตัวเลขอยู่ในช่วงมนุษย์
-    valid = (fingerOn && hr > 30.0 && hr < 220.0 && spo2 > 50.0 && spo2 <= 100.0);
+    // เช็คแยกกัน: sensor รายงาน HR กับ SpO2 คนละ sample (เช็ครวมแบบเดิม = ได้ค่าแค่ฝั่งเดียว)
+    validHr   = (fingerOn && hr > 30.0 && hr < 220.0);
+    validSpo2 = (fingerOn && spo2 > 50.0 && spo2 <= 100.0);
 
     // debug ทาง Serial ทุก sample
-    Serial.printf("[%s] HR: %.1f | SpO2: %.1f | BP: %.0f/%.0f | Finger: %s | Valid: %s\n",
+    Serial.printf("[%s] HR: %.1f | SpO2: %.1f | BP: %.0f/%.0f | Finger: %s | Valid: HR=%s SpO2=%s\n",
                   state == CLOCK_MODE ? "HOME" : "SCAN",
-                  hr, spo2, sys, dia, fingerOn ? "ON" : "OFF", valid ? "Y" : "N");
+                  hr, spo2, sys, dia, fingerOn ? "ON" : "OFF",
+                  validHr ? "Y" : "N", validSpo2 ? "Y" : "N");
   }
 
   // -------- STATE MACHINE --------
@@ -556,11 +574,10 @@ void loop() {
         break;
       }
 
-      // สะสมค่าเฉลี่ยจากทุก sample ที่ valid
-      // sample หลุดบ้าง (เช่น 7/10) ไม่เป็นไร progress หยุดรอแล้วไปต่อจนครบ 100%
-      if (valid) {
-        sumHr += hr; sumSpo2 += spo2; nSamples++;
-      }
+      // สะสมค่าเฉลี่ยแยกฝั่ง: HR valid เก็บ HR, SpO2 valid เก็บ SpO2 (มาคนละ sample ได้)
+      // progress ผูกกับ HR (nSamples) เพราะมาถี่กว่า — SpO2 ได้เท่าไหร่เอาเท่านั้น
+      if (validHr)   { sumHr   += hr;   nSamples++; }
+      if (validSpo2) { sumSpo2 += spo2; nSpo2Samples++; }
       // BP เก็บแยก: sensor จ่ายมาเมื่อไหร่เก็บเมื่อนั้น (ไม่ผูกกับ valid ของ HR/SpO2)
       // BP ต้อง calibrate สำเร็จก่อน sensor ถึงจะจ่ายค่า ไม่มีก็ปล่อย --/-- (optional)
       if (fingerOn && sys > 0 && dia > 0) {
@@ -569,8 +586,9 @@ void loop() {
 
       drawHome(); // อัปเดตแถบสถานะ/progress % บนหน้า home เดิม ไม่สลับหน้า
 
-      // เก็บ valid sample ครบเป้า = 100% -> จบสแกนสำเร็จ
-      if (nSamples >= SCAN_TARGET_SAMPLES) {
+      // HR ครบเป้าอย่างเดียวยังไม่จบ — รอ SpO2 ให้ได้อย่างน้อย SPO2_MIN_SAMPLES ก่อน
+      // (SpO2 มาช้ากว่า HR มาก ถ้าจบทันทีจะได้แต่ HR) ถ้ารอจนชนเพดานเวลาก็จบด้วย timeout ข้างล่าง
+      if (nSamples >= SCAN_TARGET_SAMPLES && nSpo2Samples >= SPO2_MIN_SAMPLES) {
         finishScan();
       } else if (millis() - detectStart >= SCAN_MAX_MS) {
         // สัญญาณแย่จนเก็บไม่ครบในเวลาเพดาน = fail แต่ยังส่งผลเท่าที่เก็บได้ขึ้น API เพื่อเทส pipeline
