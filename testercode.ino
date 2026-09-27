@@ -1,734 +1,2293 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <Preferences.h>
-#include "max32664.h"
 #include <Arduino_GFX_Library.h>
-#include <WiFi.h>
-#include <WiFiManager.h>
-#include <HTTPClient.h>
-#include <time.h>
+#include <math.h>
+#include "protocentral_pulse_express.h"
 
-/* --important infomation --
-  max32664D buy from this Provider : https://protocentral.com/product/pulse-express-pulse-ox-heart-rate-sensor-with-max32664/#downloads
-  Library from  Provider : https://github.com/Protocentral/protocentral-pulse-express
-*/
+// ======================================================
+// XIAO ESP32-C3 + MAX32664D / Pulse Express
+// R5.7: fixes stale timestamp underflow that instantly cleared new HR/SpO2/BP values
+// MAX logic/filter/calibration kept from the proven 40.2.2 code.
+// Serial Monitor: 115200
+//
+// VERIFIED ORIGINAL PIN MAP:
+// MAX GND  -> GND
+// MAX VCC  -> 3V3
+// MAX RST  -> D2 / GPIO4
+// MAX MFIO -> D1 / GPIO3
+// MAX SDA  -> D4 / GPIO6
+// MAX SCL  -> D5 / GPIO7
+//
+// MPU6050:
+// SDA -> D4 / GPIO6
+// SCL -> D5 / GPIO7
+//
+// GC9A01:
+// SCK  -> D8  / GPIO8
+// MOSI -> D10 / GPIO10
+// DC   -> D6  / GPIO21
+// CS   -> GND
+// RST  -> D7  / GPIO20
+//
+// CURRENT FREE USER PIN:
+// D0 / GPIO2 -> FREE (NO BATTERY CODE YET)
+//
+// First use:
+// 1) Measure BP 3 times with a real cuff.
+// 2) Serial Monitor -> Newline -> 115200
+// 3) Send:
+//    CAL SYS1 DIA1 SYS2 DIA2 SYS3 DIA3
+// Example FORMAT only:
+//    CAL 121 78 119 77 120 79
+//
+// Display: partial valid values appear immediately with * while filters are confirming.
+// Commands:
+// HELP / STATUS / SCAN / BEEP / FALLTEST
+ // CAL SYS1 DIA1 SYS2 DIA2 SYS3 DIA3
+ // ERASE / RESTART
+// ======================================================
 
-// -------- PIN (DO NOT MOVE) --------
-#define HUB_RESET   3
-#define HUB_MFIO    2
+#define I2C_SDA 6
+#define I2C_SCL 7
 
-#define TFT_SCK     8
-#define TFT_MOSI    10
-#define TFT_CS      20
-#define TFT_DC      21
-#define TFT_RST     5
-#define TFT_BL      4
+const int RESET_PIN = 4;  // D2
+const int MFIO_PIN  = 3;  // D1
 
-// -------- WIFI / DASHBOARD --------
-// ไม่ hardcode SSID/password แล้ว — ใช้ WiFiManager ให้ผู้ใช้ตั้งค่าเองผ่านหน้าเว็บตอนบูตครั้งแรก (บันทึกลง flash เอง)
-#define WIFI_MANAGER_AP_NAME         "SmartWatch-Setup"  // ชื่อ AP ตอนเปิดหน้าตั้งค่า WiFi
-#define WIFI_MANAGER_AP_PASSWORD     "watch1234"          // รหัสผ่าน AP ตั้งค่า (ต้อง >=8 ตัว) กันคนแปลกหน้าเข้ามาแก้ WiFi/ดักข้อมูล เปลี่ยนได้ตามต้องการ
-#define WIFI_CONFIG_PORTAL_TIMEOUT_S 180UL                // ปิด portal เองถ้าไม่มีใครตั้งค่าใน 3 นาที (กันเปิดค้างกินแบต)
-#define BOOT_BTN_PIN                 9                    // ปุ่ม BOOT บนบอร์ด XIAO ESP32C3 (active LOW) กดค้างตอนเปิดเครื่อง = ลืม WiFi เดิม
-#define API_URL       "http://172.24.155.69:8000/api/iot/vitals/"  // แก้เป็น endpoint ของ dashboard
-#define API_KEY       "DufwFwDIRjwFa6LvdwA7PmF3pg4CgA6C"  // ส่งผ่าน header X-API-Key
-#define DEVICE_NAME   "WT001"
-#define TEMPERATURE_C 36.5f  // backend บังคับส่ง แต่เซนเซอร์นี้วัดอุณหภูมิไม่ได้ — ส่งค่าคงที่ไปก่อน ถ้าต่อ MLX90614 เมื่อไหร่ค่อยเปลี่ยนเป็นค่าวัดจริง
+constexpr uint8_t PIN_BUZZER   = 5;   // D3
+constexpr uint8_t PIN_TFT_DC   = 21;  // D6
+constexpr uint8_t PIN_TFT_RST  = 20;  // D7
+constexpr uint8_t PIN_TFT_SCK  = 8;   // D8
+constexpr uint8_t PIN_BOOT     = 9;   // D9
+constexpr uint8_t PIN_TFT_MOSI = 10;  // D10
 
-// -------- TIME / BATTERY --------
-#define TZ_OFFSET_SEC (7 * 3600)  // ไทย GMT+7
-#define NTP_SERVER    "pool.ntp.org"
-// XIAO ESP32-C3 ไม่มีวงจรวัดแบตในตัว และ A0-A3 (GPIO2-5) ถูกใช้หมดแล้ว
-// ถ้าต่อ voltage divider (แบต -> 220k/220k -> GND) เข้า ADC pin ค่อยแก้เป็นเบอร์ pin
-#define BAT_PIN       -1           // -1 = ไม่มีสายวัดแบต จอโชว์ --%
-
-// -------- COLOR --------
-#define C_BLACK 0x0000
-#define C_RED   0xF800
-#define C_CYAN  0x07FF
-#define C_WHITE 0xFFFF
-#define C_GRAY  0x8410
-#define C_GREEN 0x07E0
-#define C_WARN  0xFFE0
-
-// -------- MPU6050 FALL DETECT --------
-// ต่อสายเพิ่ม: VCC->3V3, GND->GND, SDA->GPIO6, SCL->GPIO7 (แชร์ I2C bus เดียวกับ MAX32664), AD0->GND
-// หลักการ: ล้มจริง = ช่วงตกอิสระ (แรง g รวมต่ำผิดปกติ) ตามด้วยแรงกระแทก (g พุ่งสูง) ภายในเวลาสั้นๆ
-// เดินปกติ/แกว่งแขนจะไม่ครบทั้งสองเงื่อนไขติดกัน เลยไม่ค่อย false alarm
-uint8_t MPU_ADDR = 0x68;         // AD0 ต่อ GND = 0x68, ต่อ 3V3/ลอย = 0x69 — mpuBegin() ลองทั้งคู่เอง
-#define FALL_FREEFALL_G 0.45f    // g รวมต่ำกว่านี้ = กำลังตกอิสระ
-#define FALL_IMPACT_G   2.4f     // g รวมเกินนี้หลังตกอิสระ = กระแทกพื้น
-#define FALL_WINDOW_MS  600UL    // กระแทกต้องมาภายในเวลานี้หลังเริ่มตก ไม่งั้นถือว่าไม่ใช่การล้ม
-#define FALL_ALERT_MS   10000UL  // จอโชว์ FALL DETECTED ค้างนานเท่านี้ก่อนกลับหน้าหลัก
-
-// -------- SCAN TUNING --------
-// เซ็นเซอร์ให้ค่า valid ~2 ตัว/วินาที -> 20 ตัว = ~10 วิ (เพดาน 40 วิ กันสัญญาณหลุดบ่อย)
-// อย่าตั้ง TARGET สูงกว่าที่เก็บได้ทันในเพดาน ไม่งั้นสแกนจะ FAIL ตลอด จอเลยไม่โชว์ค่า
-#define SCAN_TARGET_SAMPLES 20     // valid sample ครบเท่านี้ = 100% (progress ผูกกับ detect จริง)
-#define SPO2_MIN_SAMPLES    3      // HR ครบแล้วยังรอ SpO2 ให้ได้อย่างน้อยเท่านี้ก่อนจบรอบ (SpO2 มาช้ากว่า HR มาก)
-#define SCAN_MAX_MS       40000UL  // เพดานเวลา ถ้าเก็บไม่ครบใน 40 วิ = fail (รวมเวลารอ SpO2 ด้วย)
-#define FINGER_LOST_MS    1500UL   // ยกนิ้วต่อเนื่องเกินนี้ = ยกเลิกสแกน กลับหน้าหลัก
-
-// -------- OBJECT --------
-Max32664 hub(HUB_RESET, HUB_MFIO);
+PulseExpress hub(RESET_PIN, MFIO_PIN);
 Preferences prefs;
 
-Arduino_DataBus *bus = new Arduino_ESP32SPI(
-  TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, GFX_NOT_DEFINED
+
+// ======================================================
+// GC9A01 DISPLAY - ORIGINAL SOFTWARE SPI PIN MAP
+// ======================================================
+
+Arduino_DataBus *tftBus = new Arduino_SWSPI(
+  PIN_TFT_DC,
+  GFX_NOT_DEFINED,      // CS hardwired to GND
+  PIN_TFT_SCK,
+  PIN_TFT_MOSI,
+  GFX_NOT_DEFINED       // no MISO
 );
-Arduino_GFX *gfx = new Arduino_GC9A01(bus, TFT_RST);
 
-// -------- STATE --------
-enum State {
-  CLOCK_MODE,   // หน้าหลัก (หน้าเดียว: เวลา+แบต+vitals ล่าสุด) รอวางนิ้ว
-  DETECTING     // นิ้ววางอยู่ กำลังสแกน
-};
+Arduino_GFX *tft = new Arduino_GC9A01(
+  tftBus,
+  PIN_TFT_RST,
+  0,
+  true
+);
 
-State state = CLOCK_MODE;
-bool needRelease = false;    // วัดเสร็จต้องยกนิ้วก่อน ถึงจะเริ่มสแกนใหม่ได้
+bool displayOK = false;
 
-// home render state: วาดหน้าทีละช่อง กันจอกระพริบ (ไม่ fillScreen ทั้งจอทุกวิ)
-bool homeFullDraw = true;   // true = ต้องวาดหน้าใหม่ทั้งหน้า (ตอนเข้าหน้า/มีค่าใหม่)
-int  lastBatShown = -2;
-int  lastMinShown = -1;
+constexpr uint16_t C_BLACK  = 0x0000;
+constexpr uint16_t C_WHITE  = 0xFFFF;
+constexpr uint16_t C_RED    = 0xF800;
+constexpr uint16_t C_GREEN  = 0x07E0;
+constexpr uint16_t C_CYAN   = 0x07FF;
+constexpr uint16_t C_YELLOW = 0xFFE0;
+constexpr uint16_t C_GRAY   = 0x7BEF;
+constexpr uint16_t C_DARK   = 0x2104;
 
-// -------- VAR --------
-unsigned long lastUpdate = 0;
-unsigned long detectStart = 0;
-unsigned long fingerLostAt = 0;   // เวลาที่นิ้วหลุดล่าสุด (0 = นิ้วยังอยู่)
-unsigned long fingerOffSince = 0; // debounce ตอนรอ "ยกนิ้ว" กันหลุดหลอกหลัง restartEstimation()
-#define RELEASE_DEBOUNCE_MS 400UL // ต้องไม่มีนิ้วต่อเนื่องเกินนี้ ถึงถือว่ายกนิ้วจริง
-unsigned long resultShownAt = 0;  // เวลาที่เพิ่งวาดผลวัดล่าสุดบนหน้า home
-int lastStatusKey = -999;         // สถานะแถบล่างจอที่วาดล่าสุด (กันวาดซ้ำ)
-#define MIN_HOME_HOLD_MS 3000UL   // การันตีค่าที่วัดได้ค้างจออย่างน้อยเท่านี้ ไม่ว่าจะมีอะไรมาทำให้สแกนใหม่ก่อนก็ตาม
+// ======================================================
+// MPU6050 - SHARES ORIGINAL I2C BUS
+// ======================================================
 
-float finalHr = 0, finalSpo2 = 0, finalSys = 0, finalDia = 0, finalRR = 0;
+constexpr uint8_t MPU_ADDR_A = 0x68;
+constexpr uint8_t MPU_ADDR_B = 0x69;
 
-// ตัวสะสมค่าเฉลี่ยระหว่างสแกน
-// HR กับ SpO2 นับแยกกัน: sensor รายงานมาคนละจังหวะ (spo2ReportFlag แยกจาก HR)
-// sample ที่ HR valid มักได้ SpO2=0 และกลับกัน ถ้าเช็ครวมจะได้ค่าแค่ฝั่งเดียวเสมอ
-float sumHr = 0, sumSpo2 = 0, sumSys = 0, sumDia = 0;
-int   nSamples = 0, nSpo2Samples = 0, nBpSamples = 0;
+bool mpuOK = false;
+uint8_t mpuAddr = 0;
+float accelG = 1.0f;
+float gyroDps = 0.0f;
+bool movingTooMuch = false;
+uint32_t lastMpuRead = 0;
+uint32_t lastUiMs = 0;
 
-static uint8_t calibVec[824];
-static size_t  calibLen = 0;
 
-bool wifiOk = false;
-int lastSendStatus = -1; // -1 ยังไม่เคยส่ง, 0 ส่ง fail, 1 ส่งสำเร็จ — โชว์เป็นจุดสีบนจอ
+// ======================================================
+// FALL DETECTION / BUTTON / BUZZER
+// Event-based: free-fall -> impact -> post-impact stillness
+// ======================================================
+enum FallStage : uint8_t { FALL_IDLE, FALL_FREEFALL, FALL_IMPACT_WAIT, FALL_STILL_CHECK };
+FallStage fallStage = FALL_IDLE;
 
-// fall detect state
-bool mpuOk = false;               // เจอ MPU6050 ตอนบูตไหม (ไม่เจอ = ข้าม fall detect ระบบวัดทำงานปกติ)
-unsigned long freefallAt = 0;     // เวลาที่เริ่มเจอช่วงตกอิสระ (0 = ยังไม่เจอ)
-unsigned long fallAlertAt = 0;    // เวลาที่เจอการล้มล่าสุด (0 = ไม่มี alert ค้างจอ)
+uint32_t fallStageMs = 0;
+uint32_t fallStillStartMs = 0;
+bool fallDetected = false;
+bool fallAlarmMuted = false;
+uint32_t lastFallBuzzMs = 0;
 
-// -------- UI HELPER --------
-void drawCenter(const char* txt, int y, int size, uint16_t color) {
-  int len = strlen(txt);
-  int w = len * size * 6;
-  int x = (240 - w) / 2;
+bool lastBootState = HIGH;
+uint32_t bootPressedMs = 0;
+uint32_t lastBootDebounceMs = 0;
 
-  gfx->setTextSize(size);
-  gfx->setTextColor(color);
-  gfx->setCursor(x, y);
-  gfx->print(txt);
+uint8_t uiPage = 0; // 0=vitals, 1=system/status
+
+bool maxOnline = false;
+uint32_t lastMaxRetryMs = 0;
+
+// Firmware 40.2.2 uses legacy calibration vector = 824 bytes.
+constexpr size_t CAL_MAX = 824;
+uint8_t calVector[CAL_MAX];
+size_t calLen = 0;
+
+bool haveCal = false;
+bool running = false;
+bool fingerPresent = false;
+
+// MAX/ADI example SpO2 polynomial.
+// For a final medical product this must be calibrated for the final optics.
+constexpr float SPO2_A = 1.5958422f;
+constexpr float SPO2_B = -34.659664f;
+constexpr float SPO2_C = 112.68987f;
+
+// Broad sanity gates.
+// These DO NOT force values into a normal range.
+// Bad values are rejected and shown as "--".
+constexpr float HR_MIN = 35.0f;
+constexpr float HR_MAX = 220.0f;
+constexpr float SPO2_MIN = 70.0f;
+constexpr float SPO2_MAX = 100.0f;
+constexpr int SYS_MIN = 70;
+constexpr int SYS_MAX = 250;
+constexpr int DIA_MIN = 40;
+constexpr int DIA_MAX = 150;
+
+// Filtered outputs.
+float hrFiltered = 0;
+float spo2Filtered = 0;
+float sysFiltered = 0;
+float diaFiltered = 0;
+
+bool hrReady = false;
+bool spo2Ready = false;
+bool bpReady = false;
+
+uint8_t hrCount = 0;
+uint8_t spo2Count = 0;
+uint8_t bpCount = 0;
+
+uint32_t lastHrMs = 0;
+uint32_t lastSpO2Ms = 0;
+uint32_t lastBpMs = 0;
+uint32_t lastPrintMs = 0;
+
+// Measurement notification / heartbeat.
+// Keeps Serial readable: one status line every 10 seconds.
+constexpr uint32_t MEASURE_STATUS_MS = 2000UL;
+bool hrSpo2ReadyNotified = false;
+bool bpReadyNotified = false;
+
+PulseExpressBpStatus lastBpStatus = PulseExpressBpStatus::NoSignal;
+
+// ======================================================
+// LIVE DISPLAY CACHE
+// ======================================================
+// Keep the most recent VALID values separately from the filter-ready flags.
+// This lets the watch show "partial" values immediately instead of "--"
+// while the algorithm is still collecting enough samples.
+float uiHr = 0.0f;
+float uiSpO2 = 0.0f;
+int uiSys = 0;
+int uiDia = 0;
+
+bool uiHrValid = false;
+bool uiSpO2Valid = false;
+bool uiBpValid = false;
+
+uint32_t uiHrMs = 0;
+uint32_t uiSpO2Ms = 0;
+uint32_t uiBpMs = 0;
+
+// Keep a recent result visible for a short time even if MAX reports
+// a transient contact drop.
+constexpr uint32_t UI_HR_HOLD_MS = 20000UL;
+constexpr uint32_t UI_SPO2_HOLD_MS = 20000UL;
+constexpr uint32_t UI_BP_HOLD_MS = 30000UL;
+
+// Force the next normal UI refresh when a new measurement stage becomes ready.
+bool uiForceRefresh = false;
+
+// Contact debounce.
+// MAX32664 can briefly report NO_SIGNAL/NO_CONTACT between good samples.
+// Do not erase HR/SpO2/BP from the screen because of one transient packet.
+constexpr uint8_t CONTACT_LOST_MIN_SAMPLES = 8;
+constexpr uint32_t CONTACT_LOST_MIN_MS = 300UL;
+
+uint8_t noContactSamples = 0;
+uint32_t noContactSinceMs = 0;
+bool resetFiltersOnNextContact = false;
+
+// Calibration screen state.
+// Draw the static background only once so software SPI does not waste time
+// redrawing the entire 240x240 screen every 500 ms.
+bool calibrationUiBaseDrawn = false;
+
+
+const char *bpStatusName(PulseExpressBpStatus s);
+
+// ======================================================
+// DISPLAY HELPERS
+// ======================================================
+
+void textAt(
+  int16_t x,
+  int16_t y,
+  const char *txt,
+  uint16_t color,
+  uint8_t size)
+{
+  if (!displayOK || txt == nullptr)
+    return;
+
+  tft->setTextSize(size);
+  tft->setTextColor(color, C_BLACK);
+  tft->setCursor(x, y);
+  tft->print(txt);
 }
 
-// -------- CALIBRATION STORAGE --------
-bool loadCalib() {
-  prefs.begin("pulse", true);
-  calibLen = prefs.getUInt("len", 0);
-  if (calibLen && calibLen <= sizeof(calibVec))
-    prefs.getBytes("vec", calibVec, calibLen);
-  prefs.end();
-  return calibLen > 0 && calibLen <= sizeof(calibVec);
+void drawHeart(int16_t cx, int16_t cy)
+{
+  if (!displayOK)
+    return;
+
+  tft->fillCircle(cx - 5, cy - 3, 6, C_RED);
+  tft->fillCircle(cx + 5, cy - 3, 6, C_RED);
+
+  tft->fillTriangle(
+    cx - 11, cy,
+    cx + 11, cy,
+    cx,      cy + 13,
+    C_RED
+  );
 }
 
-void saveCalib() {
-  prefs.begin("pulse", false);
-  prefs.putUInt("len", calibLen);
-  prefs.putBytes("vec", calibVec, calibLen);
-  prefs.end();
+void manualTftReset()
+{
+  pinMode(PIN_TFT_RST, OUTPUT);
+
+  digitalWrite(PIN_TFT_RST, HIGH);
+  delay(150);
+
+  digitalWrite(PIN_TFT_RST, LOW);
+  delay(250);
+
+  digitalWrite(PIN_TFT_RST, HIGH);
+  delay(350);
 }
 
-// -------- FORCE SENSOR CALIBRATION --------
-void runCalibration() {
-  Serial.println("Calibrating Sensor...");
-  gfx->fillScreen(C_BLACK);
-  drawCenter("CALIBRATE", 70, 3, C_WARN);
-  drawCenter("Hold finger 2 min", 130, 2, C_WHITE);
+void drawStaticUI()
+{
+  if (!displayOK) return;
 
-  Max32664LegacyCalibrationRefs refs;
-  for (int i = 0; i < 3; i++) {
-    refs.systolic[i]  = 120 + i * 2 + (i == 2 ? 1 : 0);
-    refs.diastolic[i] = 80  + i;
+  tft->fillScreen(C_BLACK);
+  tft->drawCircle(120, 120, 117, C_CYAN);
+  tft->drawCircle(120, 120, 116, C_DARK);
+
+  if (uiPage == 0)
+  {
+    textAt(55, 14, "SMART WATCH", C_CYAN, 2);
+
+    drawHeart(38, 60);
+    textAt(57, 53, "HEART RATE", C_WHITE, 1);
+    textAt(181, 54, "BPM", C_GRAY, 1);
+
+    tft->drawFastHLine(28, 94, 184, C_DARK);
+
+    textAt(34, 108, "SpO2", C_CYAN, 2);
+    textAt(183, 110, "%", C_GRAY, 2);
+
+    textAt(34, 149, "BP", C_YELLOW, 2);
+    textAt(174, 151, "mmHg", C_GRAY, 1);
+
+    tft->drawFastHLine(28, 188, 184, C_DARK);
+    textAt(44, 205, "WAITING SENSOR", C_GRAY, 1);
   }
+  else
+  {
+    textAt(53, 15, "SYSTEM STATUS", C_CYAN, 2);
 
-  if (hub.startCalibration(refs) != Max32664Status::Ok) {
-    Serial.println("startCalibration FAIL");
-    drawCenter("CALIB FAIL", 120, 2, C_RED);
-    delay(3000);
+    textAt(34, 52,  "MAX",  C_WHITE, 1);
+    textAt(34, 78,  "MPU",  C_WHITE, 1);
+    textAt(34, 104, "ACC",  C_WHITE, 1);
+    textAt(34, 130, "GYR",  C_WHITE, 1);
+    textAt(34, 156, "FALL", C_WHITE, 1);
+    textAt(34, 182, "FREE", C_WHITE, 1);
+
+    textAt(45, 214, "BOOT: change page", C_GRAY, 1);
+  }
+}
+
+void updateUI()
+{
+  if (!displayOK) return;
+
+  // Normal redraw is rate-limited, but new valid values can request
+  // an immediate refresh so the screen does not sit at 25%.
+  if (!uiForceRefresh && millis() - lastUiMs < 300)
+    return;
+
+  lastUiMs = millis();
+  uiForceRefresh = false;
+
+  char buf[48];
+
+  if (uiPage == 1)
+  {
+    tft->fillRect(74, 42, 142, 160, C_BLACK);
+
+    textAt(76, 52,
+           maxOnline ? "ONLINE" : "OFFLINE",
+           maxOnline ? C_GREEN : C_RED,
+           1);
+
+    textAt(76, 78,
+           mpuOK ? "READY" : "OFFLINE",
+           mpuOK ? C_GREEN : C_RED,
+           1);
+
+    snprintf(buf, sizeof(buf), "%.2fg", accelG);
+    textAt(76, 104, buf, C_WHITE, 1);
+
+    snprintf(buf, sizeof(buf), "%.1fdps", gyroDps);
+    textAt(76, 130, buf, C_WHITE, 1);
+
+    if (fallDetected)
+      textAt(76, 156,
+             fallAlarmMuted ? "ACK" : "ALERT",
+             fallAlarmMuted ? C_YELLOW : C_RED,
+             1);
+    else
+      textAt(76, 156, "NORMAL", C_GREEN, 1);
+
+    // D0/GPIO2 is intentionally unused in this clean core build.
+    textAt(76, 182, "D0 / GPIO2", C_CYAN, 1);
+
     return;
   }
 
-  Max32664Sample s;
-  uint8_t lastPct = 255;
-  char buf[24];
-  for (unsigned long t0 = millis(); millis() - t0 < 120000UL; delay(40)) {
-    if (hub.readSample(s) != Max32664Status::Ok) continue;
-    if (s.progress != lastPct) {
-      Serial.printf("Calib Progress: %3d%%\n", s.progress);
-      gfx->fillScreen(C_BLACK);
-      drawCenter("CALIBRATING", 70, 3, C_WARN);
-      sprintf(buf, "Progress %d%%", s.progress);
-      drawCenter(buf, 130, 2, C_WHITE);
-      lastPct = s.progress;
+  // ----------------------------------------------------
+  // LIVE VALUES
+  // ----------------------------------------------------
+  // READY value = filtered result.
+  // Partial value = most recent valid MAX value, shown immediately.
+
+  // Heart rate
+  tft->fillRect(75, 65, 104, 28, C_BLACK);
+
+  if (uiHrValid)
+  {
+    snprintf(buf, sizeof(buf), "%.0f%s", uiHr, hrReady ? "" : "*");
+    textAt(hrReady ? 89 : 82, 65, buf, hrReady ? C_RED : C_YELLOW, 3);
+  }
+  else
+  {
+    textAt(99, 65, "--", C_GRAY, 3);
+  }
+
+  // SpO2
+  tft->fillRect(100, 103, 82, 30, C_BLACK);
+
+  if (uiSpO2Valid)
+  {
+    snprintf(buf, sizeof(buf), "%.1f%s", uiSpO2, spo2Ready ? "" : "*");
+    textAt(spo2Ready ? 108 : 101, 104, buf, spo2Ready ? C_CYAN : C_YELLOW, 2);
+  }
+  else
+  {
+    textAt(119, 104, "--.-", C_GRAY, 2);
+  }
+
+  // Blood pressure
+  tft->fillRect(72, 143, 104, 30, C_BLACK);
+
+  if (uiBpValid)
+  {
+    snprintf(
+      buf,
+      sizeof(buf),
+      bpReady ? "%d/%d" : "%d/%d*",
+      uiSys,
+      uiDia
+    );
+
+    textAt(bpReady ? 78 : 72, 145, buf, C_YELLOW, 2);
+  }
+  else
+  {
+    textAt(91, 145, "--/--", C_GRAY, 2);
+  }
+
+  // Bottom status + small measurement progress.
+  // This percentage is only UI progress (contact -> HR/SpO2 -> BP ready),
+  // not a medical accuracy score.
+  tft->fillRect(27, 194, 187, 39, C_BLACK);
+
+  const char *msg = "WAITING";
+  uint16_t col = C_GRAY;
+  uint8_t measurePct = 0;
+
+  if (fallDetected && !fallAlarmMuted)
+  {
+    msg = "FALL ALERT";
+    col = C_RED;
+    measurePct = measurementProgressPercent();
+  }
+  else
+  {
+    measurePct = measurementProgressPercent();
+    msg = measurementProgressText();
+
+    if (!maxOnline || !running)
+      col = C_RED;
+    else if (measurePct >= 100)
+      col = C_GREEN;
+    else if (movingTooMuch)
+      col = C_YELLOW;
+    else if (measurePct >= 50)
+      col = C_CYAN;
+    else
+      col = C_GRAY;
+  }
+
+  int16_t x = 46;
+  size_t len = strlen(msg);
+
+  if (len <= 10) x = 65;
+  else if (len <= 14) x = 49;
+  else x = 31;
+
+  textAt(x, 197, msg, col, 1);
+
+  snprintf(buf, sizeof(buf), "MEASURE %u%%", measurePct);
+  textAt(80, 211, buf, C_WHITE, 1);
+
+  // Small progress bar.
+  const int16_t barX = 55;
+  const int16_t barY = 224;
+  const int16_t barW = 130;
+  const int16_t barH = 7;
+
+  tft->drawRect(barX, barY, barW, barH, C_DARK);
+
+  int16_t fillW =
+    (int16_t)(((uint32_t)(barW - 2) * measurePct) / 100UL);
+
+  if (fillW > 0)
+    tft->fillRect(barX + 1, barY + 1, fillW, barH - 2, col);
+}
+
+
+// ======================================================
+// CALIBRATION DISPLAY
+// ======================================================
+//
+// runCalibration() is a blocking loop, so the normal updateUI()
+// function does not run while calibration is active.
+// This helper updates the screen directly from the calibration loop.
+//
+const char *calibrationHint(PulseExpressBpStatus s)
+{
+  switch (s)
+  {
+    case PulseExpressBpStatus::NoSignal:
+    case PulseExpressBpStatus::NoContact:
+    case PulseExpressBpStatus::NoFinger:
+      return "PLACE FINGER";
+
+    case PulseExpressBpStatus::Motion:
+      return "HOLD STILL";
+
+    case PulseExpressBpStatus::InProgress:
+    case PulseExpressBpStatus::EstimationRetry:
+      return "MEASURING";
+
+    case PulseExpressBpStatus::Success:
+      return "COMPLETE";
+
+    case PulseExpressBpStatus::WeakSignal:
+      return "WEAK SIGNAL";
+
+    case PulseExpressBpStatus::EstimationFailure:
+      return "CAL FAILED";
+
+    default:
+      return bpStatusName(s);
+  }
+}
+
+void drawCalibrationBase()
+{
+  if (!displayOK)
+    return;
+
+  tft->fillScreen(C_BLACK);
+  tft->drawCircle(120, 120, 117, C_CYAN);
+  tft->drawCircle(120, 120, 116, C_DARK);
+
+  textAt(50, 28, "BP CALIBRATION", C_YELLOW, 2);
+
+  const int16_t barX = 38;
+  const int16_t barY = 112;
+  const int16_t barW = 164;
+  const int16_t barH = 14;
+
+  tft->drawRect(barX, barY, barW, barH, C_GRAY);
+
+  textAt(58, 174, "KEEP FINGER STILL", C_GRAY, 1);
+
+  calibrationUiBaseDrawn = true;
+}
+
+void showCalibrationScreen(
+  uint8_t progress,
+  PulseExpressBpStatus status)
+{
+  if (!displayOK)
+    return;
+
+  if (progress > 100)
+    progress = 100;
+
+  if (!calibrationUiBaseDrawn)
+    drawCalibrationBase();
+
+  char pct[12];
+  snprintf(pct, sizeof(pct), "%u%%", progress);
+
+  // Update only the changing areas. This is much lighter on XIAO C3
+  // than fillScreen() every 500 ms with software SPI.
+  tft->fillRect(68, 65, 110, 36, C_BLACK);
+
+  int16_t pctX = 88;
+  if (progress < 10) pctX = 103;
+  else if (progress < 100) pctX = 94;
+
+  textAt(pctX, 72, pct, C_WHITE, 3);
+
+  const int16_t barX = 38;
+  const int16_t barY = 112;
+  const int16_t barW = 164;
+  const int16_t barH = 14;
+
+  uint16_t barColor = C_CYAN;
+
+  if (status == PulseExpressBpStatus::Motion)
+    barColor = C_YELLOW;
+  else if (status == PulseExpressBpStatus::Success)
+    barColor = C_GREEN;
+  else if (status == PulseExpressBpStatus::EstimationFailure)
+    barColor = C_RED;
+
+  // Erase only inside the bar, then refill to the new percentage.
+  tft->fillRect(barX + 2, barY + 2, barW - 4, barH - 4, C_BLACK);
+
+  int16_t fillW =
+    (int16_t)(((uint32_t)(barW - 4) * progress) / 100UL);
+
+  if (fillW > 0)
+    tft->fillRect(barX + 2, barY + 2, fillW, barH - 4, barColor);
+
+  const char *hint = calibrationHint(status);
+
+  tft->fillRect(36, 145, 168, 22, C_BLACK);
+
+  size_t len = strlen(hint);
+  int16_t hintX = 65;
+
+  if (len <= 8) hintX = 84;
+  else if (len <= 12) hintX = 68;
+  else hintX = 50;
+
+  textAt(hintX, 151, hint, barColor, 1);
+
+  // Short raw MAX status only.
+  tft->fillRect(46, 187, 160, 17, C_BLACK);
+
+  char rawStatus[30];
+  snprintf(
+    rawStatus,
+    sizeof(rawStatus),
+    "MAX: %s",
+    bpStatusName(status)
+  );
+
+  textAt(54, 190, rawStatus, C_GRAY, 1);
+}
+
+void showCalibrationError(const char *msg)
+{
+  if (!displayOK)
+    return;
+
+  tft->fillScreen(C_BLACK);
+  tft->drawCircle(120, 120, 117, C_RED);
+
+  textAt(61, 62, "CALIBRATION", C_YELLOW, 2);
+  textAt(78, 92, "FAILED", C_RED, 2);
+
+  if (msg && *msg)
+    textAt(48, 132, msg, C_WHITE, 1);
+
+  textAt(53, 165, "TRY AGAIN / HOLD STILL", C_GRAY, 1);
+}
+
+
+
+// ======================================================
+// BUZZER / FALL / BUTTON
+// ======================================================
+
+void buzzerBeep(uint16_t ms)
+{
+  digitalWrite(PIN_BUZZER, HIGH);
+  delay(ms);
+  digitalWrite(PIN_BUZZER, LOW);
+}
+
+void resetFallDetector()
+{
+  fallStage = FALL_IDLE;
+  fallStageMs = 0;
+  fallStillStartMs = 0;
+}
+
+void triggerFallAlert()
+{
+  fallDetected = true;
+  fallAlarmMuted = false;
+  resetFallDetector();
+
+  Serial.println();
+  Serial.println("!!! FALL DETECTED !!!");
+  Serial.println("Press BOOT to acknowledge/silence alarm.");
+
+  buzzerBeep(180);
+  delay(80);
+  buzzerBeep(180);
+}
+
+void updateFallDetection(uint32_t now)
+{
+  if (!mpuOK) return;
+
+  // Ignore fall classifier while BP calibration is actively blocking normal use.
+  // Sequence reduces false positives compared with a single acceleration threshold.
+  switch (fallStage)
+  {
+    case FALL_IDLE:
+      if (accelG < 0.45f)
+      {
+        fallStage = FALL_FREEFALL;
+        fallStageMs = now;
+      }
+      break;
+
+    case FALL_FREEFALL:
+      // Need an impact within 1.2 s after free-fall.
+      if (accelG > 2.20f)
+      {
+        fallStage = FALL_STILL_CHECK;
+        fallStageMs = now;
+        fallStillStartMs = 0;
+      }
+      else if (now - fallStageMs > 1200)
+      {
+        resetFallDetector();
+      }
+      break;
+
+    case FALL_IMPACT_WAIT:
+      // Kept for enum compatibility; current algorithm transitions directly.
+      resetFallDetector();
+      break;
+
+    case FALL_STILL_CHECK:
+    {
+      if (now - fallStageMs < 1200)
+        break;
+
+      bool postureStable =
+        accelG >= 0.70f &&
+        accelG <= 1.30f &&
+        gyroDps < 35.0f;
+
+      if (postureStable)
+      {
+        if (fallStillStartMs == 0)
+          fallStillStartMs = now;
+
+        if (now - fallStillStartMs >= 1500)
+          triggerFallAlert();
+      }
+      else
+      {
+        fallStillStartMs = 0;
+      }
+
+      if (now - fallStageMs > 5000)
+        resetFallDetector();
+
+      break;
     }
-    if (s.bpStatus == Max32664BpStatus::Success && s.progress >= 100) break;
   }
 
-  hub.readCalibrationVector(calibVec, sizeof(calibVec), &calibLen);
-  saveCalib();
-  hub.stop();
-  Serial.printf("Calibration completed and saved (%d bytes)\n", calibLen);
-}
-
-void beginEstimation() {
-  hub.loadCalibrationVector(calibVec, calibLen);
-  hub.startEstimation(Max32664Spo2Coeffs{});
-}
-
-// hub หยุด stream หลังจบรอบวัด ต้อง stop + start ใหม่ทุกครั้งก่อนกลับหน้าหลัก
-// ไม่งั้น readSample fail ตลอด = สแกนได้แค่รอบเดียว
-void restartEstimation() {
-  hub.stop();
-  delay(100);
-  beginEstimation();
-}
-
-// -------- WIFI + JSON UPLOAD --------
-// ใช้ WiFiManager แทน hardcode SSID/password: ถ้าเคยตั้งค่าไว้แล้วจะต่อเองอัตโนมัติ
-// ถ้ายังไม่เคยตั้ง (หรือกดปุ่ม BOOT ค้างตอนเปิดเครื่อง) จะเปิด AP ชื่อ WIFI_MANAGER_AP_NAME
-// ให้เอามือถือ/คอมไปต่อ แล้วเข้า http://192.168.4.1 เพื่อเลือก WiFi + ใส่รหัสผ่าน (บันทึกลง flash เอง ไม่ต้องแก้โค้ดใหม่)
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false); // เน็ต IoT บางที่ตัดการเชื่อมต่อถ้าเข้า power-save
-  Serial.printf("Device MAC: %s (เอาไปแจ้ง IT ลงทะเบียน MAC ถ้าเน็ตต้อง whitelist)\n", WiFi.macAddress().c_str());
-
-  // สแกนแล้ว print SSID ที่มองเห็นจริงออก Serial — เอาไว้เช็คว่า AP เป้าหมายสัญญาณอ่อน/มองไม่เห็นจริงไหม
-  int found = WiFi.scanNetworks();
-  Serial.printf("WiFi scan: found %d network(s)\n", found);
-  for (int i = 0; i < found; i++) {
-    Serial.printf("  %2d) %-32s RSSI=%d dBm  ch=%d  %s\n",
-                  i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
-                  WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "SECURED");
-  }
-
-  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(WIFI_CONFIG_PORTAL_TIMEOUT_S);
-  wm.setConnectTimeout(20);   // เน็ต IoT บางที่ handshake ช้า ค่า default สั้นไปอาจ timeout ก่อนต่อสำเร็จ
-  wm.setConnectRetries(3);    // ลองต่อซ้ำก่อนจะถือว่า fail จริง (กันสัญญาณอ่อน/หลุดชั่วขณะ)
-
-  if (digitalRead(BOOT_BTN_PIN) == LOW) {
-    Serial.println("BOOT held at boot -> ลืม WiFi เดิม เปิดหน้าตั้งค่าใหม่");
-    wm.resetSettings();
-  }
-
-  gfx->fillScreen(C_BLACK);
-  drawCenter("WIFI SETUP", 60, 2, C_WARN);
-  drawCenter("Connect phone to:", 95, 1, C_WHITE);
-  drawCenter(WIFI_MANAGER_AP_NAME, 115, 2, C_CYAN);
-  drawCenter("AP password:", 145, 1, C_WHITE);
-  drawCenter(WIFI_MANAGER_AP_PASSWORD, 160, 1, C_CYAN);
-  drawCenter("then open 192.168.4.1", 180, 1, C_GRAY);
-  drawCenter("(skip if already set up)", 195, 1, C_GRAY);
-
-  wifiOk = wm.autoConnect(WIFI_MANAGER_AP_NAME, WIFI_MANAGER_AP_PASSWORD);
-
-  if (wifiOk) {
-    WiFi.setAutoReconnect(true); // เน็ตหลุดแล้วต่อเองเบื้องหลัง ไม่งั้นหลุดครั้งเดียว = ส่ง API ไม่ได้อีกเลยจนรีบูต
-    WiFi.setSleep(false);        // set ซ้ำหลัง autoConnect เพราะ WiFiManager อาจ reset โหมดระหว่าง portal
-    Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
-    configTime(TZ_OFFSET_SEC, 0, NTP_SERVER); // เวลาจริงจาก NTP sync เองเบื้องหลัง
-  } else {
-    // status code: 1=NO_SSID_AVAIL, 4=CONNECT_FAILED (มักเป็น MAC ยังไม่ลงทะเบียน/รหัสผิด), 6=WRONG_PASSWORD
-    Serial.printf("WiFi FAILED (offline mode), status code=%d\n", WiFi.status());
+  // Alarm pattern: short double chirp every 2 seconds until acknowledged.
+  if (fallDetected && !fallAlarmMuted && now - lastFallBuzzMs >= 2000)
+  {
+    lastFallBuzzMs = now;
+    buzzerBeep(80);
+    delay(60);
+    buzzerBeep(80);
   }
 }
 
-// -------- BATTERY --------
-int readBatteryPct() {
-  if (BAT_PIN < 0) return -1;
-  uint32_t mv = analogReadMilliVolts(BAT_PIN) * 2; // divider หาร 2
-  int pct = (int)((mv - 3300) * 100 / (4200 - 3300)); // LiPo 3.3V=0% 4.2V=100%
-  return constrain(pct, 0, 100);
+void handleBootButton(uint32_t now)
+{
+  bool state = digitalRead(PIN_BOOT);
+
+  if (state != lastBootState && now - lastBootDebounceMs >= 35)
+  {
+    lastBootDebounceMs = now;
+    lastBootState = state;
+
+    if (state == LOW)
+    {
+      bootPressedMs = now;
+    }
+    else
+    {
+      uint32_t held = now - bootPressedMs;
+
+      if (fallDetected && !fallAlarmMuted)
+      {
+        fallAlarmMuted = true;
+        Serial.println("[FALL] Alarm acknowledged by BOOT button.");
+        buzzerBeep(50);
+      }
+      else if (held < 1500)
+      {
+        uiPage = (uiPage + 1) % 2;
+        drawStaticUI();
+      }
+      else
+      {
+        // Long press clears a previous acknowledged fall event.
+        if (fallDetected)
+        {
+          fallDetected = false;
+          fallAlarmMuted = false;
+          resetFallDetector();
+          Serial.println("[FALL] Event cleared.");
+          buzzerBeep(60);
+        }
+      }
+    }
+  }
 }
 
-// ประมาณอัตราการหายใจจาก HR — เซนเซอร์นี้ไม่มีทางวัด RR ตรงๆ ได้
-// ใช้สัดส่วน HR:RR ~4:1 ที่พบทั่วไปตอนพัก (คร่าวๆเท่านั้น ไม่ใช่ค่าวัดจริง แม่นยำต่ำกว่า HR/SpO2/BP มาก)
-float estimateRespRate(float hr) {
-  return constrain(hr / 4.0f, 8.0f, 40.0f);
+void scanI2C()
+{
+  Serial.println();
+  Serial.println("========== I2C SCAN ==========");
+
+  uint8_t count = 0;
+
+  for (uint8_t a = 1; a < 127; a++)
+  {
+    Wire.beginTransmission(a);
+    uint8_t e = Wire.endTransmission();
+
+    if (e == 0)
+    {
+      Serial.printf("FOUND 0x%02X", a);
+
+      if (a == 0x55) Serial.print(" <- MAX32664D");
+      if (a == 0x68 || a == 0x69) Serial.print(" <- MPU6050");
+
+      Serial.println();
+      count++;
+    }
+  }
+
+  Serial.printf("TOTAL FOUND = %u\n", count);
+  Serial.println("==============================");
+  Serial.println("Auto measurement status prints every 10 seconds. Display shows small progress/status.");
 }
 
-// ดึงเวลาปัจจุบันเป็น ISO8601 "YYYY-MM-DDTHH:MM:SS" จาก NTP, false ถ้ายังไม่ sync
-bool getIsoTimestamp(char *buf, size_t len) {
-  struct tm t;
-  if (!getLocalTime(&t, 0)) return false;
-  strftime(buf, len, "%Y-%m-%dT%H:%M:%S", &t);
+
+// ======================================================
+// MPU6050 HELPERS
+// ======================================================
+
+bool i2cPresent(uint8_t addr)
+{
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+bool mpuWrite(uint8_t reg, uint8_t value)
+{
+  if (!mpuAddr) return false;
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool mpuReadReg(uint8_t reg, uint8_t &value)
+{
+  if (!mpuAddr) return false;
+
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  if (Wire.requestFrom(mpuAddr, (uint8_t)1) != 1) return false;
+  value = Wire.read();
   return true;
 }
 
-// ส่งผลวัดขึ้น dashboard: {"device_id":"...","temperature":36.5,"heart_rate":72,"spo2":98,...}
-// ไม่ส่ง patient_id — backend ผูก device_id กับผู้ป่วยเอง / temperature เป็น field บังคับ
-// sampleCount < SCAN_TARGET_SAMPLES = ส่งมาแม้ scan "fail" (เก็บ sample ไม่ครบ) เพื่อให้เทส API pipeline ได้แม้สแกนไม่สมบูรณ์
-// "partial":true บอก backend/dashboard ว่าค่านี้ความเชื่อถือได้ต่ำกว่าปกติ ไม่ใช่ผลวัดที่ครบสมบูรณ์
-bool sendVitals(float hr, float spo2, float sys, float dia, int sampleCount) {
-  // เน็ตหลุดชั่วขณะเป็นเรื่องปกติ — ลอง reconnect แล้วรอสั้นๆ ก่อนยอมแพ้ (บล็อกจอสูงสุด ~4 วิ เฉพาะตอนหลุดจริง)
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi down -> reconnecting...");
-    WiFi.reconnect();
-    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(200);
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Send skipped: no WiFi");
-      return false;
-    }
+bool initMpu()
+{
+  mpuOK = false;
+  mpuAddr = 0;
+
+  if (i2cPresent(MPU_ADDR_A)) mpuAddr = MPU_ADDR_A;
+  else if (i2cPresent(MPU_ADDR_B)) mpuAddr = MPU_ADDR_B;
+
+  if (!mpuAddr)
+  {
+    Serial.println("[MPU] NOT FOUND");
+    return false;
   }
 
-  char ts[24];
-  bool haveTs = getIsoTimestamp(ts, sizeof(ts));
-  bool partial = sampleCount < SCAN_TARGET_SAMPLES;
+  uint8_t who = 0;
+  if (!mpuReadReg(0x75, who)) return false;
 
-  // ทุก vital เป็น optional หมด — ส่ง 0 ไป backend จะโดน validation ตีกลับ 400
-  // รอบไหนวัดอะไรได้ก็ส่งอันนั้น (เช่น ได้แต่ SpO2 ก็ส่งแต่ SpO2)
-  char json[384];
-  int n = snprintf(json, sizeof(json),
-    "{\"device_id\":\"%s\",\"temperature\":%.1f,\"sample_count\":%d,\"partial\":%s",
-    DEVICE_NAME, TEMPERATURE_C, sampleCount, partial ? "true" : "false");
-  if (hr > 0) {
-    n += snprintf(json + n, sizeof(json) - n,
-      ",\"heart_rate\":%d,\"respiratory_rate\":%d", (int)hr, (int)estimateRespRate(hr));
-  }
-  if (spo2 > 0) {
-    n += snprintf(json + n, sizeof(json) - n, ",\"spo2\":%d", (int)spo2);
-  }
-  if (sys > 0 && dia > 0) {
-    // BP เป็น optional — ไม่มีค่าก็ไม่ส่ง field
-    n += snprintf(json + n, sizeof(json) - n,
-      ",\"blood_pressure_sys\":%d,\"blood_pressure_dia\":%d", (int)sys, (int)dia);
-  }
-  if (haveTs) {
-    n += snprintf(json + n, sizeof(json) - n, ",\"timestamp\":\"%s\"", ts);
-  }
-  snprintf(json + n, sizeof(json) - n, "}");
+  Serial.printf("[MPU] addr=0x%02X WHO_AM_I=0x%02X\\n", mpuAddr, who);
 
-  // ลอง 2 รอบ: timeout/หลุดชั่วขณะรอบแรกไม่ควรทำให้ผลวัดหายทั้งรอบ
-  int code = -1;
-  for (int attempt = 1; attempt <= 2; attempt++) {
-    HTTPClient http;
-    http.begin(API_URL);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-API-Key", API_KEY);
-    http.setConnectTimeout(3000);
-    http.setTimeout(5000); // 3000 เดิมสั้นไปสำหรับ backend ที่ตอบช้า ทำให้ fail ทั้งที่ server ได้รับแล้ว
-    code = http.POST(json);
-    http.end();
+  if (!mpuWrite(0x6B, 0x00)) return false;
+  delay(20);
+  if (!mpuWrite(0x1A, 0x03)) return false;
+  if (!mpuWrite(0x19, 0x09)) return false;
+  if (!mpuWrite(0x1B, 0x08)) return false;
+  if (!mpuWrite(0x1C, 0x08)) return false;
 
-    // code < 0 = error ฝั่ง client (ต่อไม่ติด/timeout) — errorToString บอกสาเหตุจริง
-    Serial.printf("POST attempt %d -> %d%s : %s\n", attempt, code,
-                  code < 0 ? (String(" (") + HTTPClient::errorToString(code) + ")").c_str() : "",
-                  json);
-    if (code >= 200 && code < 300) return true;
-    if (attempt == 1) delay(500);
-  }
-  return false;
+  mpuOK = true;
+  Serial.println("[MPU] READY");
+  return true;
 }
 
-// -------- MPU6050 FALL DETECT --------
-// คุยกับชิปผ่าน Wire ตรงๆ (ไม่ต้องลง library เพิ่ม): ปลุกชิป + ตั้งช่วงวัด ±8g กันค่ากระแทกโดน clip
-bool mpuBegin() {
-  Wire.setClock(100000); // ลดเหลือ 100kHz ชั่วคราวตอน scan — สายจัมป์เปอร์ยาว/รางหลวมบางทีวิ่ง 400k ไม่ไหว
-  // scan ทั้ง bus ออก Serial ก่อน — เห็นเลยว่าอุปกรณ์ไหนตอบบ้าง (debug สายหลวม/address ผิด)
-  Serial.print("I2C scan:");
-  for (uint8_t a = 1; a < 127; a++) {
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission() == 0) Serial.printf(" 0x%02X", a);
-  }
-  Serial.println();
+bool readMpu()
+{
+  if (!mpuAddr) return false;
 
-  // ลองทั้ง 0x68 และ 0x69 (AD0 ลอย/ต่อ 3V3 = 0x69)
-  for (uint8_t addr = 0x68; addr <= 0x69; addr++) {
-    Wire.beginTransmission(addr);
-    Wire.write(0x6B); Wire.write(0x00);           // PWR_MGMT_1 = 0 ปลุกจาก sleep
-    if (Wire.endTransmission() != 0) continue;
-    Wire.beginTransmission(addr);
-    Wire.write(0x1C); Wire.write(0x10);           // ACCEL_CONFIG = ±8g กันค่ากระแทกโดน clip
-    if (Wire.endTransmission() == 0) {
-      MPU_ADDR = addr;
-      Serial.printf("MPU6050 found at 0x%02X\n", addr);
-      Wire.setClock(100000); // เจอที่ 100k ก็อยู่ 100k ต่อ (MAX32664 ใช้ 100k ได้ ช้าลงนิดแต่ชัวร์)
-      return true;
-    }
-  }
-  Wire.setClock(400000); // ไม่เจอ MPU -> คืนความเร็วเดิมให้ MAX32664
-  return false;
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  if (Wire.requestFrom(mpuAddr, (uint8_t)14) != 14) return false;
+
+  int16_t ax = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t ay = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t az = (int16_t)((Wire.read() << 8) | Wire.read());
+
+  Wire.read(); Wire.read();
+
+  int16_t gx = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t gy = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t gz = (int16_t)((Wire.read() << 8) | Wire.read());
+
+  float xg = ax / 8192.0f;
+  float yg = ay / 8192.0f;
+  float zg = az / 8192.0f;
+  accelG = sqrtf(xg*xg + yg*yg + zg*zg);
+
+  float xd = gx / 65.5f;
+  float yd = gy / 65.5f;
+  float zd = gz / 65.5f;
+  gyroDps = sqrtf(xd*xd + yd*yd + zd*zd);
+
+  // MPU is ONLY a warning for UI. It does not change MAX32664 filter logic.
+  movingTooMuch = (fabsf(accelG - 1.0f) > 0.20f) || (gyroDps > 45.0f);
+  return true;
 }
 
-// อ่านความเร่งรวม 3 แกนเป็นหน่วย g (นิ่งๆ = ~1.0 จากแรงโน้มถ่วง, ตกอิสระ = ~0, กระแทก = พุ่งสูง)
-// คืน -1 ถ้าอ่านไม่สำเร็จ (สายหลุดกลางทาง)
-float mpuAccelG() {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B);                              // ACCEL_XOUT_H
-  if (Wire.endTransmission(false) != 0) return -1;
-  if (Wire.requestFrom(MPU_ADDR, 6) != 6) return -1;
-  int16_t ax = (Wire.read() << 8) | Wire.read();
-  int16_t ay = (Wire.read() << 8) | Wire.read();
-  int16_t az = (Wire.read() << 8) | Wire.read();
-  const float s = 4096.0f;                       // ±8g -> 4096 LSB/g
-  float x = ax / s, y = ay / s, z = az / s;
-  return sqrtf(x * x + y * y + z * z);
+// ======================================================
+// TEXT HELPERS
+// ======================================================
+
+const char *statusName(PulseExpressStatus s)
+{
+  switch (s)
+  {
+    case PulseExpressStatus::Ok:                  return "OK";
+    case PulseExpressStatus::IllegalIndex:        return "ILLEGAL_INDEX";
+    case PulseExpressStatus::IllegalByteCount:    return "ILLEGAL_BYTE_COUNT";
+    case PulseExpressStatus::IllegalConfig:       return "ILLEGAL_CONFIG";
+    case PulseExpressStatus::NotInAppMode:        return "NOT_IN_APP_MODE";
+    case PulseExpressStatus::DeviceBusy:          return "DEVICE_BUSY";
+    case PulseExpressStatus::UnknownHubError:     return "UNKNOWN_HUB_ERROR";
+    case PulseExpressStatus::HostCommError:       return "HOST_COMM_ERROR";
+    case PulseExpressStatus::UnsupportedFirmware: return "UNSUPPORTED_FW";
+    case PulseExpressStatus::Timeout:             return "TIMEOUT";
+    case PulseExpressStatus::InvalidArgument:     return "INVALID_ARGUMENT";
+    case PulseExpressStatus::BufferTooSmall:      return "BUFFER_TOO_SMALL";
+    case PulseExpressStatus::NoDataAvailable:     return "NO_DATA";
+    case PulseExpressStatus::NotConfigured:       return "NOT_CONFIGURED";
+    default:                                      return "UNKNOWN";
+  }
 }
 
-// แจ้งเหตุล้มขึ้น dashboard ทันที (แยกจากผลวัด vitals): {"device_id":..,"event":"fall",..}
-// backend อาจยังไม่มี field นี้ — ถ้าโดน 400 ให้ทีมเว็บเพิ่ม event/fall_detected ฝั่ง Django
-void sendFallAlert() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("FALL alert not sent: no WiFi");
+const char *bpStatusName(PulseExpressBpStatus s)
+{
+  switch (s)
+  {
+    case PulseExpressBpStatus::NoSignal:              return "NO_SIGNAL";
+    case PulseExpressBpStatus::InProgress:            return "IN_PROGRESS";
+    case PulseExpressBpStatus::Success:               return "SUCCESS";
+    case PulseExpressBpStatus::WeakSignal:            return "WEAK_SIGNAL";
+    case PulseExpressBpStatus::Motion:                return "MOTION";
+    case PulseExpressBpStatus::EstimationFailure:     return "ESTIMATION_FAIL";
+    case PulseExpressBpStatus::CalibrationPartial:    return "CAL_PARTIAL";
+    case PulseExpressBpStatus::SubjectInitFailure:    return "SUBJECT_INIT_FAIL";
+    case PulseExpressBpStatus::InitCompleted:         return "INIT_COMPLETED";
+    case PulseExpressBpStatus::RefBpTrendingError:    return "REF_BP_ERROR";
+    case PulseExpressBpStatus::RefInconsistency1:     return "REF_INCONSISTENCY_1";
+    case PulseExpressBpStatus::RefInconsistency2:     return "REF_INCONSISTENCY_2";
+    case PulseExpressBpStatus::RefInconsistency3:     return "REF_INCONSISTENCY_3";
+    case PulseExpressBpStatus::RefCountMismatch:      return "REF_COUNT_MISMATCH";
+    case PulseExpressBpStatus::RefOutOfLimits:        return "REF_OUT_OF_LIMITS";
+    case PulseExpressBpStatus::TooManyCalibrations:   return "TOO_MANY_CAL";
+    case PulseExpressBpStatus::PulsePressureOutRange: return "PULSE_PRESSURE_RANGE";
+    case PulseExpressBpStatus::HrOutOfRange:          return "HR_OUT_OF_RANGE";
+    case PulseExpressBpStatus::HrAboveResting:        return "HR_ABOVE_RESTING";
+    case PulseExpressBpStatus::PerfusionOutOfRange:   return "PERFUSION_RANGE";
+    case PulseExpressBpStatus::EstimationRetry:       return "RETRY";
+    case PulseExpressBpStatus::EstimateOutOfRefRange: return "BP_OUT_OF_REF_RANGE";
+    case PulseExpressBpStatus::EstimateOutOfMaxLimit: return "BP_OVER_MAX_LIMIT";
+    case PulseExpressBpStatus::NoContact:             return "NO_CONTACT";
+    case PulseExpressBpStatus::NoFinger:              return "NO_FINGER";
+    default:                                          return "UNKNOWN";
+  }
+}
+
+void printStatus(const char *label, PulseExpressStatus s)
+{
+  Serial.print(label);
+  Serial.print(" = 0x");
+  Serial.print((uint8_t)s, HEX);
+  Serial.print(" (");
+  Serial.print(statusName(s));
+  Serial.println(")");
+}
+
+// ======================================================
+// VALIDATION
+// ======================================================
+
+bool validHR(float v)
+{
+  return isfinite(v) && v >= HR_MIN && v <= HR_MAX;
+}
+
+bool validSpO2(float v)
+{
+  return isfinite(v) && v >= SPO2_MIN && v <= SPO2_MAX;
+}
+
+bool validBP(int sys, int dia)
+{
+  if (sys < SYS_MIN || sys > SYS_MAX) return false;
+  if (dia < DIA_MIN || dia > DIA_MAX) return false;
+  if (sys <= dia) return false;
+
+  int pp = sys - dia;
+  if (pp < 10 || pp > 120) return false;
+
+  return true;
+}
+
+bool noFingerStatus(PulseExpressBpStatus s)
+{
+  return s == PulseExpressBpStatus::NoSignal ||
+         s == PulseExpressBpStatus::NoContact ||
+         s == PulseExpressBpStatus::NoFinger;
+}
+
+bool badSignalStatus(PulseExpressBpStatus s)
+{
+  return s == PulseExpressBpStatus::WeakSignal ||
+         s == PulseExpressBpStatus::Motion ||
+         s == PulseExpressBpStatus::EstimationFailure ||
+         s == PulseExpressBpStatus::SubjectInitFailure ||
+         s == PulseExpressBpStatus::RefBpTrendingError ||
+         s == PulseExpressBpStatus::RefInconsistency1 ||
+         s == PulseExpressBpStatus::RefInconsistency2 ||
+         s == PulseExpressBpStatus::RefInconsistency3 ||
+         s == PulseExpressBpStatus::RefCountMismatch ||
+         s == PulseExpressBpStatus::RefOutOfLimits ||
+         s == PulseExpressBpStatus::TooManyCalibrations ||
+         s == PulseExpressBpStatus::PulsePressureOutRange ||
+         s == PulseExpressBpStatus::HrOutOfRange ||
+         s == PulseExpressBpStatus::HrAboveResting ||
+         s == PulseExpressBpStatus::PerfusionOutOfRange ||
+         s == PulseExpressBpStatus::EstimateOutOfRefRange ||
+         s == PulseExpressBpStatus::EstimateOutOfMaxLimit;
+}
+
+void clearFilters()
+{
+  hrFiltered = 0;
+  spo2Filtered = 0;
+  sysFiltered = 0;
+  diaFiltered = 0;
+
+  hrReady = false;
+  spo2Ready = false;
+  bpReady = false;
+
+  hrCount = 0;
+  spo2Count = 0;
+  bpCount = 0;
+}
+
+void clearUiMeasurementCache()
+{
+  uiHr = 0.0f;
+  uiSpO2 = 0.0f;
+  uiSys = 0;
+  uiDia = 0;
+
+  uiHrValid = false;
+  uiSpO2Valid = false;
+  uiBpValid = false;
+
+  uiHrMs = 0;
+  uiSpO2Ms = 0;
+  uiBpMs = 0;
+}
+
+void updateUiMeasurementCache(
+  float hr,
+  float spo2,
+  PulseExpressBpStatus bpStatus,
+  int sys,
+  int dia)
+{
+  uint32_t now = millis();
+
+  bool changed = false;
+
+  if (validHR(hr))
+  {
+    if (!uiHrValid || fabsf(uiHr - hr) >= 0.5f)
+      changed = true;
+
+    uiHr = hr;
+    uiHrValid = true;
+    uiHrMs = now;
+  }
+
+  if (validSpO2(spo2))
+  {
+    if (!uiSpO2Valid || fabsf(uiSpO2 - spo2) >= 0.1f)
+      changed = true;
+
+    uiSpO2 = spo2;
+    uiSpO2Valid = true;
+    uiSpO2Ms = now;
+  }
+
+  if (bpStatus == PulseExpressBpStatus::Success &&
+      validBP(sys, dia))
+  {
+    if (!uiBpValid || uiSys != sys || uiDia != dia)
+      changed = true;
+
+    uiSys = sys;
+    uiDia = dia;
+    uiBpValid = true;
+    uiBpMs = now;
+  }
+
+  if (changed)
+    uiForceRefresh = true;
+}
+
+uint8_t measurementProgressPercent()
+{
+  // This is a UI progress indicator, not a medical accuracy score.
+  if (!maxOnline || !running)
+    return 0;
+
+  if (uiBpValid && uiHrValid && uiSpO2Valid)
+    return 100;
+
+  if (uiHrValid && uiSpO2Valid)
+    return 75;
+
+  if (uiHrValid)
+    return 50;
+
+  if (fingerPresent)
+    return movingTooMuch ? 20 : 25;
+
+  return 0;
+}
+
+const char *measurementProgressText()
+{
+  if (!maxOnline)
+    return "MAX OFFLINE";
+
+  if (!running && !haveCal)
+    return "NEED BP CAL";
+
+  if (!running)
+    return "ESTIMATION OFF";
+
+  if (uiBpValid && uiHrValid && uiSpO2Valid)
+    return "READING READY";
+
+  if (uiHrValid && uiSpO2Valid)
+    return "WAITING BP";
+
+  if (uiHrValid)
+    return "HR FOUND";
+
+  if (!fingerPresent)
+    return "PLACE FINGER";
+
+  if (movingTooMuch)
+    return "HOLD STILL";
+
+  return "MEASURING";
+}
+
+// ======================================================
+// FILTERS
+// ======================================================
+
+void updateHR(float v)
+{
+  if (!validHR(v)) return;
+
+  if (hrCount == 0)
+  {
+    hrFiltered = v;
+    hrCount = 1;
+    lastHrMs = millis();
     return;
   }
-  char ts[24];
-  bool haveTs = getIsoTimestamp(ts, sizeof(ts));
-  char json[192];
-  int n = snprintf(json, sizeof(json),
-    "{\"device_id\":\"%s\",\"event\":\"fall\",\"fall_detected\":true", DEVICE_NAME);
-  if (haveTs) n += snprintf(json + n, sizeof(json) - n, ",\"timestamp\":\"%s\"", ts);
-  snprintf(json + n, sizeof(json) - n, "}");
 
-  HTTPClient http;
-  http.begin(API_URL);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", API_KEY);
-  http.setConnectTimeout(3000);
-  http.setTimeout(5000);
-  int code = http.POST(json);
-  http.end();
-  Serial.printf("FALL POST -> %d : %s\n", code, json);
+  // Reject a one-sample jump larger than 30 bpm.
+  if (fabsf(v - hrFiltered) > 30.0f) return;
+
+  hrFiltered = 0.22f * v + 0.78f * hrFiltered;
+
+  if (hrCount < 255) hrCount++;
+  if (hrCount >= 5) hrReady = true;
+
+  lastHrMs = millis();
 }
 
-// เรียกทุก loop: จับ pattern ตกอิสระ -> กระแทก ภายใน FALL_WINDOW_MS = ล้ม
-void checkFall() {
-  if (!mpuOk) return;
-  float g = mpuAccelG();
-  if (g < 0) return; // อ่านพลาดครั้งนี้ ข้ามไป
+void updateSpO2(float v)
+{
+  if (!validSpO2(v)) return;
 
-  // debug: print เฉพาะตอนค่าหลุดช่วงปกติ (นิ่งๆ ~1.0g) จะได้เห็นว่าใกล้ threshold แค่ไหน
-  if (g < 0.6f || g > 1.8f) Serial.printf("[MPU] g=%.2f%s\n", g, freefallAt ? " (freefall!)" : "");
-
-  if (g < FALL_FREEFALL_G) {
-    if (freefallAt == 0) freefallAt = millis();       // เริ่มนับหน้าต่างเวลารอกระแทก
-  } else if (freefallAt != 0) {
-    if (g > FALL_IMPACT_G && millis() - freefallAt <= FALL_WINDOW_MS) {
-      Serial.printf("FALL DETECTED! freefall->impact %.2fg in %lums\n", g, millis() - freefallAt);
-      freefallAt = 0;
-      fallAlertAt = millis();
-      gfx->fillScreen(C_RED);
-      drawCenter("FALL", 80, 5, C_WHITE);
-      drawCenter("DETECTED!", 130, 3, C_WHITE);
-      sendFallAlert();
-    } else if (millis() - freefallAt > FALL_WINDOW_MS) {
-      freefallAt = 0;                                  // หมดหน้าต่างเวลา ไม่มีกระแทกตาม = ไม่ใช่การล้ม
-    }
+  if (spo2Count == 0)
+  {
+    spo2Filtered = v;
+    spo2Count = 1;
+    lastSpO2Ms = millis();
+    return;
   }
+
+  // Reject a sudden 1-sample jump >6%.
+  if (fabsf(v - spo2Filtered) > 6.0f) return;
+
+  spo2Filtered = 0.18f * v + 0.82f * spo2Filtered;
+
+  if (spo2Count < 255) spo2Count++;
+  if (spo2Count >= 5) spo2Ready = true;
+
+  lastSpO2Ms = millis();
 }
 
-// -------- MAIN APP UI --------
-// หน้าเดียวจบ ไม่มีหน้า SCANNING แยกแล้ว: แบต + เวลาจริง + HR/SpO2/BP/RR + แถบสถานะล่างสุด
-// ที่เปลี่ยนไปตามว่ากำลังวัดอยู่ไหม (progress %) วาดทีละช่อง ลบเฉพาะกล่องที่เปลี่ยน -> จอนิ่ง ไม่กระพริบ
-void drawHome() {
-  char buf[24];
+void updateBP(int sys, int dia)
+{
+  if (!validBP(sys, dia)) return;
 
-  // ---- วาดทั้งหน้าครั้งเดียว: กรอบไอคอนแบต + vitals ----
-  if (homeFullDraw) {
-    homeFullDraw = false;
-    lastBatShown = -2;
-    lastMinShown = -2; // -2 = ยังไม่วาดเวลาเลย (ต่างจาก key=-1 ตอน NTP ยังไม่ sync)
-    lastStatusKey = -999; // บังคับวาดแถบสถานะใหม่ด้วย
-    gfx->fillScreen(C_BLACK);
-
-    // กรอบไอคอนแบต (คงที่)
-    gfx->drawRect(150, 20, 26, 14, C_WHITE);
-    gfx->fillRect(176, 24, 3, 6, C_WHITE);
-
-    // จุดสถานะ API รอบล่าสุด: เขียว=ส่งสำเร็จ แดง=fail เทา=ยังไม่เคยส่ง
-    gfx->fillCircle(66, 27, 5, lastSendStatus == 1 ? C_GREEN : lastSendStatus == 0 ? C_RED : C_GRAY);
-
-    // vitals (เปลี่ยนเฉพาะหลังวัดเสร็จ -> วาดตรงนี้พอ)
-    if (finalHr > 0) sprintf(buf, "HR   : %d", (int)finalHr);
-    else             strcpy(buf, "HR   : --");
-    drawCenter(buf, 105, 2, C_RED);
-
-    if (finalSpo2 > 0) sprintf(buf, "SpO2 : %d%%", (int)finalSpo2);
-    else               strcpy(buf, "SpO2 : --");
-    drawCenter(buf, 130, 2, C_CYAN);
-
-    if (finalSys > 0 && finalDia > 0) sprintf(buf, "BP   : %d/%d", (int)finalSys, (int)finalDia);
-    else                              strcpy(buf, "BP   : --/--");
-    drawCenter(buf, 155, 2, C_GREEN);
-
-    // RR เป็นค่าประมาณจาก HR (ไม่มี sensor วัดตรง) จึงโชว์คู่กับ "~" กันเข้าใจผิดว่าเป็นค่าวัดจริง
-    if (finalRR > 0) sprintf(buf, "RR ~ : %d", (int)finalRR);
-    else              strcpy(buf, "RR ~ : --");
-    drawCenter(buf, 180, 2, C_WARN);
+  if (bpCount == 0)
+  {
+    sysFiltered = sys;
+    diaFiltered = dia;
+    bpCount = 1;
+    lastBpMs = millis();
+    return;
   }
 
-  // ---- แบต + เวลา: throttle วินาทีละครั้งพอ (ไม่ต้องเร็วกว่านี้) ----
-  if (millis() - lastUpdate >= 1000) {
-    lastUpdate = millis();
+  if (fabsf((float)sys - sysFiltered) > 35.0f) return;
+  if (fabsf((float)dia - diaFiltered) > 25.0f) return;
 
-    int bat = readBatteryPct();
-    if (bat != lastBatShown) {
-      lastBatShown = bat;
-      if (bat >= 0) sprintf(buf, "%d%%", bat);
-      else          strcpy(buf, "--%");
-      gfx->fillRect(80, 20, 65, 16, C_BLACK);          // ลบเลข % เก่า
-      gfx->setTextSize(2);
-      gfx->setTextColor(C_WHITE);
-      gfx->setCursor(145 - (int)strlen(buf) * 12, 20); // ชิดขวาติดไอคอน
-      gfx->print(buf);
-      int fw = (bat >= 0 ? bat : 100) * 22 / 100;      // -1 = โชว์เต็มสีเทา
-      uint16_t bc = (bat < 0) ? C_GRAY : (bat > 30 ? C_GREEN : C_RED);
-      gfx->fillRect(152, 22, 22, 10, C_BLACK);         // ลบไส้เก่า
-      gfx->fillRect(152, 22, fw, 10, bc);
-    }
+  sysFiltered = 0.25f * sys + 0.75f * sysFiltered;
+  diaFiltered = 0.25f * dia + 0.75f * diaFiltered;
 
-    struct tm t;
-    int key;
-    if (getLocalTime(&t, 0)) {                          // sync แล้ว -> เวลาจริง
-      sprintf(buf, "%02d:%02d", t.tm_hour, t.tm_min);
-      key = t.tm_hour * 60 + t.tm_min;
-    } else {                                            // ยังไม่ sync (รอเน็ต) -> รอ
-      strcpy(buf, "--:--");
-      key = -1;
-    }
-    if (key != lastMinShown) {
-      lastMinShown = key;
-      gfx->fillRect(0, 60, 240, 40, C_BLACK);          // ลบเวลาเก่า (เฉพาะแถบนี้)
-      drawCenter(buf, 60, 5, C_WHITE);
-    }
-  }
+  if (bpCount < 255) bpCount++;
+  if (bpCount >= 2) bpReady = true;
 
-  drawStatusLine(); // อัปเดตทุกครั้งที่เรียก (ไม่ throttle) progress % ต้องขยับทันที ไม่รอ 1 วิ
+  lastBpMs = millis();
 }
 
-// แถบสถานะล่างจอ home: 3 สถานะ — "Scanning... NN%" ตอนวัด, "Lift finger" ตอนวัดเสร็จแต่นิ้วยังวางค้าง
-// (needRelease ค้าง = ไม่ยอมเริ่มรอบใหม่จนกว่าจะยกนิ้ว ถ้าไม่บอกผู้ใช้จะค้างแบบงงๆ), "Place finger" ตอนว่างจริง
-// แทนที่หน้า SCANNING แยกทั้งหน้าแบบเดิม กันจอวูบวาบ + เห็นค่า HR/SpO2/BP/RR เดิมตลอดเวลาแม้กำลังวัดรอบใหม่
-void drawStatusLine() {
-  int pct = 0;
-  int key;
-  if (state == DETECTING) {
-    pct = nSamples * 100 / SCAN_TARGET_SAMPLES;
-    if (pct > 100) pct = 100;
-    key = 1000 + pct;
-  } else if (needRelease) {
-    key = 2;
-  } else {
-    key = 0;
-  }
-  if (key == lastStatusKey) return; // ไม่เปลี่ยน ไม่ต้องวาดซ้ำ กันกระพริบ
-  lastStatusKey = key;
+// ======================================================
+// NVS CALIBRATION STORAGE
+// ======================================================
 
-  gfx->fillRect(0, 200, 240, 30, C_BLACK); // ลบเฉพาะแถบสถานะ ไม่แตะ vitals ด้านบน
+bool saveCalibration()
+{
+  PulseExpressVersion v = hub.version();
 
-  if (state == DETECTING) {
-    char buf[20];
-    sprintf(buf, "Scanning... %d%%", pct);
-    drawCenter(buf, 203, 1, C_GREEN);
-    gfx->drawRect(60, 220, 120, 8, C_GRAY);
-    gfx->fillRect(61, 221, (118 * pct) / 100, 6, C_GREEN);
-  } else if (needRelease) {
-    drawCenter("Done! Lift finger to rescan", 205, 1, C_WARN);
-  } else {
-    drawCenter("Place finger to scan", 205, 1, C_GRAY);
-  }
+  prefs.putUInt("magic", 0x504C5345UL);
+  prefs.putUChar("fwMaj", v.major);
+  prefs.putUChar("fwMin", v.minor);
+  prefs.putUChar("fwPat", v.patch);
+  prefs.putUInt("len", (uint32_t)calLen);
+
+  size_t n = prefs.putBytes("vector", calVector, calLen);
+
+  return n == calLen;
 }
 
-// -------- SCAN HELPERS --------
-void resetScan() {
-  sumHr = sumSpo2 = sumSys = sumDia = 0;
-  nSamples = nSpo2Samples = nBpSamples = 0;
-  fingerLostAt = 0;
+bool loadCalibration()
+{
+  if (prefs.getUInt("magic", 0) != 0x504C5345UL)
+    return false;
+
+  PulseExpressVersion v = hub.version();
+
+  if (prefs.getUChar("fwMaj", 0) != v.major) return false;
+  if (prefs.getUChar("fwMin", 0) != v.minor) return false;
+  if (prefs.getUChar("fwPat", 0) != v.patch) return false;
+
+  size_t expected = hub.caps().calibVectorBytes;
+
+  if (expected > CAL_MAX) return false;
+  if (prefs.getUInt("len", 0) != expected) return false;
+  if (prefs.getBytesLength("vector") != expected) return false;
+
+  size_t n = prefs.getBytes("vector", calVector, expected);
+  if (n != expected) return false;
+
+  calLen = expected;
+  return true;
 }
 
-// จบสแกน ไม่ว่าจะเก็บครบเป้าหรือหมดเวลา/นิ้วหลุดก่อน -> สรุปผลเท่าที่เก็บได้แล้วส่ง API
-// ส่งแม้ sample ไม่ครบ (nSamples < SCAN_TARGET_SAMPLES) เพื่อให้เทส API pipeline ได้แม้สแกนไม่สมบูรณ์
-// (field "partial":true ใน JSON บอก backend ว่าค่านี้ความเชื่อถือได้ต่ำกว่าปกติ)
-void finishScan() {
-  // แต่ละค่าเฉลี่ยจากตัวนับของตัวเอง — HR/SpO2 มาคนละจังหวะ นับรวมกันไม่ได้
-  if (nSamples > 0 || nSpo2Samples > 0) {
-    finalHr   = nSamples     ? sumHr / nSamples : 0;
-    finalSpo2 = nSpo2Samples ? sumSpo2 / nSpo2Samples : 0;
-    finalSys  = nBpSamples   ? sumSys / nBpSamples : 0;
-    finalDia  = nBpSamples   ? sumDia / nBpSamples : 0;
-    finalRR   = finalHr > 0  ? estimateRespRate(finalHr) : 0;
 
-    Serial.printf("%s: HR %.0f (n=%d) | SpO2 %.0f (n=%d) | BP %.0f/%.0f (%d/%d samples, %.1fs)\n",
-                  nSamples >= SCAN_TARGET_SAMPLES ? "RESULT" : "PARTIAL(FAIL)",
-                  finalHr, nSamples, finalSpo2, nSpo2Samples, finalSys, finalDia,
-                  nSamples, SCAN_TARGET_SAMPLES, (millis() - detectStart) / 1000.0);
+// ======================================================
+// LEGACY FW 40.2.2 CALIBRATION VECTOR LOADER
+// ======================================================
+//
+// Legacy MAX32664D firmware 40.2.2 expects the 824-byte
+// BPT calibration vector as one I2C command:
+//   0x50 0x04 0x03 + 824 data bytes
+//
+// ESP32 Wire defaults to 128 bytes, so setup() enlarges
+// the buffer to 1024 bytes before I2C use.
+//
+PulseExpressStatus loadLegacyCalibrationVectorSingleFrame(
+  const uint8_t *vec,
+  size_t len)
+{
+  if (vec == nullptr || len != 824)
+    return PulseExpressStatus::InvalidArgument;
 
-    lastSendStatus = sendVitals(finalHr, finalSpo2, finalSys, finalDia, nSamples) ? 1 : 0;
-  } else {
-    Serial.println("Scan failed: 0 valid samples, nothing to send");
+  Wire.beginTransmission(0x55);
+
+  if (Wire.write((uint8_t)0x50) != 1 ||
+      Wire.write((uint8_t)0x04) != 1 ||
+      Wire.write((uint8_t)0x03) != 1)
+  {
+    Wire.endTransmission();
+    return PulseExpressStatus::BufferTooSmall;
   }
 
-  restartEstimation();  // สำคัญ: ไม่ restart แล้ว hub จะไม่ส่ง sample อีก = จอค้างรอบสอง
-  needRelease = false;  // วัดต่อเนื่อง: นิ้ววางค้างไว้ = เริ่มรอบใหม่เองหลังโชว์ผลครบ MIN_HOME_HOLD_MS แล้วส่ง API ทุกรอบ
-  resultShownAt = millis(); // เริ่มนับเวลาค้างจอผลลัพธ์
-  homeFullDraw = true;  // วาดค่าใหม่ + เคลียร์แถบสถานะกลับเป็น idle ทันที
-  state = CLOCK_MODE;
+  size_t wrote = Wire.write(vec, len);
+
+  if (wrote != len)
+  {
+    Wire.endTransmission();
+    return PulseExpressStatus::BufferTooSmall;
+  }
+
+  uint8_t tx = Wire.endTransmission();
+
+  if (tx != 0)
+    return PulseExpressStatus::HostCommError;
+
+  delay(100);
+
+  size_t got = Wire.requestFrom((uint8_t)0x55, (size_t)1);
+
+  if (got != 1 || !Wire.available())
+    return PulseExpressStatus::HostCommError;
+
+  uint8_t hubStatus = Wire.read();
+
+  return (PulseExpressStatus)hubStatus;
 }
 
-// -------- SETUP --------
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
+// ======================================================
+// START LIVE ESTIMATION
+// ======================================================
 
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+bool startLive()
+{
+  PulseExpressStatus s;
 
-  gfx->begin();
-  gfx->fillScreen(C_BLACK);
-  drawCenter("BOOTING...", 120, 2, C_GRAY);
-
-  Wire.begin(6, 7);
-  Wire.setClock(400000);
-
-  if (hub.begin() != Max32664Status::Ok) {
-    drawCenter("HUB ERROR", 150, 2, C_RED);
-    while (1);
+  if (calLen != hub.caps().calibVectorBytes)
+  {
+    Serial.println("[EST] Invalid calibration vector length.");
+    return false;
   }
 
-  mpuOk = mpuBegin();
-  Serial.printf("MPU6050: %s\n", mpuOk ? "OK" : "NOT FOUND (fall detect disabled)");
-
-  connectWiFi(); // ต่อเน็ตก่อน calibrate จะได้ไม่ไปหน่วงตอนวัด
-
-  if (loadCalib()) {
-    Serial.printf("Loaded calib vector (%d bytes)\n", calibLen);
-  } else {
-    runCalibration();
+  if (hub.caps().multiPointCalib)
+  {
+    s = hub.loadCalibrationVector(0, calVector, calLen);
+  }
+  else
+  {
+    // Legacy firmware such as 40.2.2:
+    // send all 824 calibration bytes in one I2C frame.
+    s = loadLegacyCalibrationVectorSingleFrame(
+      calVector,
+      calLen
+    );
   }
 
-  beginEstimation();
-  gfx->fillScreen(C_BLACK);
+  printStatus("[EST] loadCalibrationVector", s);
+
+  if (s != PulseExpressStatus::Ok)
+    return false;
+
+  PulseExpressSpo2Coeffs coeffs;
+  coeffs.a = SPO2_A;
+  coeffs.b = SPO2_B;
+  coeffs.c = SPO2_C;
+
+  s = hub.startEstimation(coeffs);
+
+  printStatus("[EST] startEstimation", s);
+
+  if (s != PulseExpressStatus::Ok)
+    return false;
+
+  running = true;
+  fingerPresent = false;
+
+  noContactSamples = 0;
+  noContactSinceMs = 0;
+  resetFiltersOnNextContact = false;
+
+  clearFilters();
+  clearUiMeasurementCache();
+  uiForceRefresh = true;
+
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println(" LIVE HR / SpO2 / BP STARTED");
+  Serial.println(" Put finger fully on sensor and stay still.");
+  Serial.println("======================================");
+
+  return true;
 }
 
-// -------- LOOP --------
-void loop() {
-  checkFall(); // เช็คทุกรอบ (~50Hz) ไม่ว่าจะอยู่ state ไหน — การล้มรอไม่ได้
+// ======================================================
+// BP CALIBRATION
+// ======================================================
 
-  // alert ล้มค้างจอ FALL_ALERT_MS แล้วค่อยกลับหน้าหลัก (ระหว่างนี้หยุดวาด/สแกนชั่วคราว)
-  if (fallAlertAt) {
-    if (millis() - fallAlertAt >= FALL_ALERT_MS) {
-      fallAlertAt = 0;
-      homeFullDraw = true; // วาดหน้า home ใหม่ทับจอแดง
-      resetScan();
-      state = CLOCK_MODE;
-    } else {
-      delay(20);
-      return;
-    }
+void restoreLiveAfterCalibrationFailure(bool hadSavedCalibrationBefore)
+{
+  if (!hadSavedCalibrationBefore)
+    return;
+
+  Serial.println("[CAL] Keeping previous saved calibration.");
+
+  hub.stop();
+  delay(250);
+
+  // Reload the previous 824-byte vector already held in calVector/NVS.
+  haveCal = true;
+
+  if (startLive())
+    Serial.println("[CAL] Previous calibration restored; live measurement resumed.");
+  else
+    Serial.println("[CAL] WARNING: could not restore previous live measurement.");
+
+  drawStaticUI();
+  lastUiMs = 0;
+  uiForceRefresh = true;
+}
+
+bool runCalibration(
+  int s1, int d1,
+  int s2, int d2,
+  int s3, int d3)
+{
+  // If the watch already has a saved calibration, preserve it.
+  // A failed re-calibration must not leave normal measurement OFF.
+  bool hadSavedCalibrationBefore = haveCal;
+  if (!validBP(s1, d1) ||
+      !validBP(s2, d2) ||
+      !validBP(s3, d3))
+  {
+    Serial.println("[CAL] Invalid cuff values.");
+    return false;
   }
 
-  Max32664Sample sample;
-  bool haveSample = false;
-  bool fingerOn = false;
-  bool validHr = false, validSpo2 = false;
-  float hr = 0, spo2 = 0, sys = 0, dia = 0;
-
-  if (hub.readSample(sample) == Max32664Status::Ok) {
-    haveSample = true;
-    hr = sample.heartRate();
-    spo2 = sample.spo2();
-    sys = sample.systolic;
-    dia = sample.diastolic;
-
-    fingerOn = (sample.bpStatus != Max32664BpStatus::NoFinger);
-    // เช็คแยกกัน: sensor รายงาน HR กับ SpO2 คนละ sample (เช็ครวมแบบเดิม = ได้ค่าแค่ฝั่งเดียว)
-    validHr   = (fingerOn && hr > 30.0 && hr < 220.0);
-    validSpo2 = (fingerOn && spo2 > 50.0 && spo2 <= 100.0);
-
-    // debug ทาง Serial ทุก sample
-    Serial.printf("[%s] HR: %.1f | SpO2: %.1f | BP: %.0f/%.0f | Finger: %s | Valid: HR=%s SpO2=%s\n",
-                  state == CLOCK_MODE ? "HOME" : "SCAN",
-                  hr, spo2, sys, dia, fingerOn ? "ON" : "OFF",
-                  validHr ? "Y" : "N", validSpo2 ? "Y" : "N");
+  // User has firmware 40.2.2 => legacy 3-reference flow.
+  if (hub.caps().multiPointCalib)
+  {
+    Serial.println("[CAL] This code path is for legacy firmware such as 40.2.2.");
+    return false;
   }
 
-  // -------- STATE MACHINE --------
-  // ไม่มีหน้า SCANNING แยกแล้ว — ทั้งสอง state วาดผ่าน drawHome() เดียวกันเสมอ (สถานะเปลี่ยนแค่แถบล่างจอ)
-  switch (state) {
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println(" BP CALIBRATION");
+  Serial.println("======================================");
+  Serial.printf("Cuff #1 = %d/%d\n", s1, d1);
+  Serial.printf("Cuff #2 = %d/%d\n", s2, d2);
+  Serial.printf("Cuff #3 = %d/%d\n", s3, d3);
+  Serial.println("Keep finger still on the optical sensor.");
 
-    case CLOCK_MODE:
-      drawHome();
-      // debounce "ยกนิ้ว": ต้องไม่มีนิ้วต่อเนื่องเกิน RELEASE_DEBOUNCE_MS ถึงเคลียร์ needRelease
-      // กัน sample หลอกหลัง restartEstimation() ทำให้จอกลับเข้า DETECTING ทันทีจนเห็นค่าใหม่ไม่ทัน
-      if (haveSample) {
-        if (!fingerOn) {
-          if (fingerOffSince == 0) fingerOffSince = millis();
-          if (needRelease && millis() - fingerOffSince > RELEASE_DEBOUNCE_MS) needRelease = false;
-        } else {
-          fingerOffSince = 0;
-        }
+  running = false;
+  clearFilters();
+
+  PulseExpressStatus stopStatus = hub.stop();
+  if (stopStatus != PulseExpressStatus::Ok)
+    printStatus("[CAL] stop", stopStatus);
+
+  delay(300);
+
+  PulseExpressLegacyCalibrationRefs refs;
+
+  refs.systolic[0] = (uint8_t)s1;
+  refs.systolic[1] = (uint8_t)s2;
+  refs.systolic[2] = (uint8_t)s3;
+
+  refs.diastolic[0] = (uint8_t)d1;
+  refs.diastolic[1] = (uint8_t)d2;
+  refs.diastolic[2] = (uint8_t)d3;
+
+  PulseExpressStatus st = hub.startCalibration(refs);
+  printStatus("[CAL] startCalibration", st);
+
+  if (st != PulseExpressStatus::Ok)
+  {
+    showCalibrationError("START ERROR");
+    delay(1200);
+    drawStaticUI();
+    lastUiMs = 0;
+    return false;
+  }
+
+  // Normal loop() is blocked during calibration, so show progress here.
+  uiPage = 0;
+  calibrationUiBaseDrawn = false;
+
+  showCalibrationScreen(
+    0,
+    PulseExpressBpStatus::NoSignal
+  );
+
+  uint32_t startMs = millis();
+  uint32_t lastMsg = 0;
+
+  PulseExpressSample sample;
+
+  while (true)
+  {
+    st = hub.readSample(sample);
+
+    if (st == PulseExpressStatus::Ok)
+    {
+      if (millis() - lastMsg >= 500)
+      {
+        lastMsg = millis();
+
+        Serial.print("[CAL] progress=");
+        Serial.print(sample.progress);
+        Serial.print("% status=");
+        Serial.print((uint8_t)sample.bpStatus);
+        Serial.print(" ");
+        Serial.println(bpStatusName(sample.bpStatus));
+
+        showCalibrationScreen(
+          sample.progress,
+          sample.bpStatus
+        );
       }
-      // ต้องค้างหน้าผลลัพธ์ให้ครบ MIN_HOME_HOLD_MS ก่อน ถึงจะยอมเริ่มสแกนรอบใหม่
-      if (haveSample && fingerOn && !needRelease && millis() - resultShownAt >= MIN_HOME_HOLD_MS) {
-        // เจอนิ้ว -> เริ่มสแกนทันที
-        resetScan();
-        detectStart = millis();
-        state = DETECTING;
-      }
-      break;
 
-    case DETECTING: {
-      // debug: นิ้วหลุดต่อเนื่องเกินกำหนด -> จบสแกน (ส่งผลเท่าที่เก็บได้) กลับหน้าหลัก
-      if (haveSample) {
-        if (fingerOn) {
-          fingerLostAt = 0;
-        } else if (fingerLostAt == 0) {
-          fingerLostAt = millis();
-        }
-      }
-      if (fingerLostAt && millis() - fingerLostAt > FINGER_LOST_MS) {
-        Serial.println("Finger removed early");
-        finishScan();
+      if (sample.bpStatus == PulseExpressBpStatus::Success &&
+          sample.progress >= 100)
+      {
         break;
       }
 
-      // สะสมค่าเฉลี่ยแยกฝั่ง: HR valid เก็บ HR, SpO2 valid เก็บ SpO2 (มาคนละ sample ได้)
-      // progress ผูกกับ HR (nSamples) เพราะมาถี่กว่า — SpO2 ได้เท่าไหร่เอาเท่านั้น
-      if (validHr)   { sumHr   += hr;   nSamples++; }
-      if (validSpo2) { sumSpo2 += spo2; nSpo2Samples++; }
-      // BP เก็บแยก: sensor จ่ายมาเมื่อไหร่เก็บเมื่อนั้น (ไม่ผูกกับ valid ของ HR/SpO2)
-      // BP ต้อง calibrate สำเร็จก่อน sensor ถึงจะจ่ายค่า ไม่มีก็ปล่อย --/-- (optional)
-      if (fingerOn && sys > 0 && dia > 0) {
-        sumSys += sys; sumDia += dia; nBpSamples++;
-      }
+      if (sample.bpStatus == PulseExpressBpStatus::EstimationFailure ||
+          sample.bpStatus == PulseExpressBpStatus::SubjectInitFailure ||
+          sample.bpStatus == PulseExpressBpStatus::TooManyCalibrations ||
+          sample.bpStatus == PulseExpressBpStatus::RefCountMismatch ||
+          sample.bpStatus == PulseExpressBpStatus::RefOutOfLimits)
+      {
+        Serial.print("[CAL] Calibration rejected: ");
+        Serial.println(bpStatusName(sample.bpStatus));
 
-      drawHome(); // อัปเดตแถบสถานะ/progress % บนหน้า home เดิม ไม่สลับหน้า
+        showCalibrationError(
+          bpStatusName(sample.bpStatus)
+        );
 
-      // HR ครบเป้าอย่างเดียวยังไม่จบ — รอ SpO2 ให้ได้อย่างน้อย SPO2_MIN_SAMPLES ก่อน
-      // (SpO2 มาช้ากว่า HR มาก ถ้าจบทันทีจะได้แต่ HR) ถ้ารอจนชนเพดานเวลาก็จบด้วย timeout ข้างล่าง
-      if (nSamples >= SCAN_TARGET_SAMPLES && nSpo2Samples >= SPO2_MIN_SAMPLES) {
-        finishScan();
-      } else if (millis() - detectStart >= SCAN_MAX_MS) {
-        // สัญญาณแย่จนเก็บไม่ครบในเวลาเพดาน = fail แต่ยังส่งผลเท่าที่เก็บได้ขึ้น API เพื่อเทส pipeline
-        Serial.printf("Scan timeout: only %d/%d valid samples in %lus\n",
-                      nSamples, SCAN_TARGET_SAMPLES, SCAN_MAX_MS / 1000);
-        finishScan();
+        delay(1500);
+        drawStaticUI();
+        return false;
       }
+    }
+    else if (st != PulseExpressStatus::NoDataAvailable &&
+             st != PulseExpressStatus::DeviceBusy)
+    {
+      printStatus("[CAL] readSample", st);
+    }
+
+    if (millis() - startMs > 120000UL)
+    {
+      Serial.println("[CAL] TIMEOUT 120 sec.");
+
+      showCalibrationError("TIMEOUT");
+
+      delay(1500);
+      drawStaticUI();
+      return false;
+    }
+
+    delay(20);
+  }
+
+  Serial.println("[CAL] 100% complete.");
+
+  size_t written = 0;
+
+  st = hub.readCalibrationVector(
+    calVector,
+    sizeof(calVector),
+    &written
+  );
+
+  printStatus("[CAL] readCalibrationVector", st);
+
+  if (st != PulseExpressStatus::Ok)
+  {
+    showCalibrationError("READ VECTOR ERROR");
+    delay(1500);
+    drawStaticUI();
+    lastUiMs = 0;
+    return false;
+  }
+
+  calLen = written;
+
+  Serial.print("[CAL] Vector bytes = ");
+  Serial.println(calLen);
+
+  if (calLen != hub.caps().calibVectorBytes)
+  {
+    Serial.println("[CAL] Wrong vector size.");
+    showCalibrationError("VECTOR SIZE ERROR");
+    delay(1500);
+    drawStaticUI();
+    lastUiMs = 0;
+    return false;
+  }
+
+  if (!saveCalibration())
+  {
+    Serial.println("[CAL] NVS save failed.");
+    showCalibrationError("NVS SAVE ERROR");
+    delay(1500);
+    drawStaticUI();
+    lastUiMs = 0;
+    return false;
+  }
+
+  haveCal = true;
+
+  Serial.println("[CAL] Saved to ESP32 NVS.");
+
+  showCalibrationScreen(
+    100,
+    PulseExpressBpStatus::Success
+  );
+
+  delay(900);
+
+  st = hub.stop();
+  if (st != PulseExpressStatus::Ok)
+    printStatus("[CAL] stop after calibration", st);
+
+  delay(300);
+
+  drawStaticUI();
+  lastUiMs = 0;
+
+  return startLive();
+}
+
+// ======================================================
+// MEASUREMENT NOTIFICATION
+// ======================================================
+
+void notifyMeasurementReady()
+{
+  if (!fingerPresent)
+    return;
+
+  // HR + SpO2: one short beep once per contact/measurement cycle.
+  if (hrReady && spo2Ready && !hrSpo2ReadyNotified)
+  {
+    hrSpo2ReadyNotified = true;
+
+    // Mirror the CONFIRMED filtered values to the display cache.
+    // This guarantees the screen gets the same values printed to Serial.
+    uiHr = hrFiltered;
+    uiSpO2 = spo2Filtered;
+    uiHrValid = true;
+    uiSpO2Valid = true;
+    uiHrMs = millis();
+    uiSpO2Ms = millis();
+    uiForceRefresh = true;
+
+    Serial.println();
+    Serial.println("[MEASURE] HR + SpO2 READY");
+
+    Serial.print("[MEASURE] HR=");
+    Serial.print(hrFiltered, 1);
+    Serial.print(" bpm | SpO2=");
+    Serial.print(spo2Filtered, 1);
+    Serial.println(" %");
+
+    buzzerBeep(70);
+  }
+
+  // BP: two short beeps once when BP becomes valid.
+  if (bpReady && !bpReadyNotified)
+  {
+    bpReadyNotified = true;
+
+    // Mirror confirmed BP to the display cache immediately.
+    uiSys = (int)roundf(sysFiltered);
+    uiDia = (int)roundf(diaFiltered);
+    uiBpValid = true;
+    uiBpMs = millis();
+    uiForceRefresh = true;
+
+    Serial.print("[MEASURE] BP READY = ");
+    Serial.print(uiSys);
+    Serial.print("/");
+    Serial.print(uiDia);
+    Serial.println(" mmHg");
+
+    buzzerBeep(70);
+    delay(90);
+    buzzerBeep(70);
+  }
+}
+
+void printMeasurementStatus()
+{
+  uint32_t now = millis();
+
+  if (now - lastPrintMs < MEASURE_STATUS_MS)
+    return;
+
+  lastPrintMs = now;
+
+  uint8_t pct = measurementProgressPercent();
+
+  Serial.print("[MEASURE] ");
+  Serial.print(pct);
+  Serial.print("% | ");
+  Serial.print(measurementProgressText());
+
+  Serial.print(" | MAX=");
+  Serial.print(bpStatusName(lastBpStatus));
+
+  Serial.print(" | HR=");
+  if (uiHrValid)
+  {
+    Serial.print(uiHr, 1);
+    Serial.print(" bpm");
+  }
+  else
+  {
+    Serial.print("--");
+  }
+
+  Serial.print(" | SpO2=");
+  if (uiSpO2Valid)
+  {
+    Serial.print(uiSpO2, 1);
+    Serial.print("%");
+  }
+  else
+  {
+    Serial.print("--");
+  }
+
+  Serial.print(" | BP=");
+  if (uiBpValid)
+  {
+    Serial.print(uiSys);
+    Serial.print("/");
+    Serial.print(uiDia);
+  }
+  else
+  {
+    Serial.print("--/--");
+  }
+
+  Serial.println();
+}
+
+// ======================================================
+// PROCESS HUB SAMPLE
+// ======================================================
+
+void processSample(const PulseExpressSample &s)
+{
+  lastBpStatus = s.bpStatus;
+  uint32_t now = millis();
+
+  if (noFingerStatus(s.bpStatus))
+  {
+    if (noContactSinceMs == 0)
+      noContactSinceMs = now;
+
+    if (noContactSamples < 255)
+      noContactSamples++;
+
+    // Ignore short NO_SIGNAL / NO_CONTACT glitches.
+    // This was the reason the R5.3 display often fell back to 35%.
+    if (noContactSamples < CONTACT_LOST_MIN_SAMPLES ||
+        now - noContactSinceMs < CONTACT_LOST_MIN_MS)
+    {
+      return;
+    }
+
+    if (fingerPresent)
+      Serial.println("[FINGER] REMOVED / NO CONTACT");
+
+    fingerPresent = false;
+    uiForceRefresh = true;
+
+    // Keep the last valid values visible.
+    // The filters will be reset only when a NEW contact begins.
+    resetFiltersOnNextContact = true;
+
+    return;
+  }
+
+  // Good/contact packet arrived.
+  noContactSamples = 0;
+  noContactSinceMs = 0;
+
+  // A real removal followed by a new contact starts a fresh measurement.
+  if (!fingerPresent && resetFiltersOnNextContact)
+  {
+    clearFilters();
+
+    hrSpo2ReadyNotified = false;
+    bpReadyNotified = false;
+
+    resetFiltersOnNextContact = false;
+  }
+
+  fingerPresent = true;
+
+  // Read whatever valid partial values MAX already has.
+  // We cache them for the screen even before the filters become READY.
+  float hr = s.heartRate();
+  float spo2 = s.spo2();
+
+  updateUiMeasurementCache(
+    hr,
+    spo2,
+    s.bpStatus,
+    s.systolic,
+    s.diastolic
+  );
+
+  if (badSignalStatus(s.bpStatus))
+    return;
+
+  updateHR(hr);
+  updateSpO2(spo2);
+
+  // BP is accepted into the filtered result only on genuine SUCCESS.
+  if (s.bpStatus == PulseExpressBpStatus::Success)
+  {
+    updateBP(
+      s.systolic,
+      s.diastolic
+    );
+  }
+
+  notifyMeasurementReady();
+}
+
+// ======================================================
+// DRAIN FIFO FAST
+// ======================================================
+
+void pollLive()
+{
+  if (!running) return;
+
+  while (true)
+  {
+    PulseExpressSample samples[8];
+    size_t n = 0;
+
+    PulseExpressStatus st =
+      hub.readSamples(samples, 8, &n);
+
+    if (st != PulseExpressStatus::Ok)
+    {
+      if (st != PulseExpressStatus::NoDataAvailable &&
+          st != PulseExpressStatus::DeviceBusy)
+      {
+        printStatus("[LIVE] readSamples", st);
+      }
+      return;
+    }
+
+    for (size_t i = 0; i < n; i++)
+      processSample(samples[i]);
+
+    // FIFO drained enough.
+    if (n < 8)
       break;
+  }
+}
+
+// ======================================================
+// PRINT LIVE VALUES
+// ======================================================
+
+void printLive()
+{
+  printMeasurementStatus();
+}
+
+
+// ======================================================
+// MAX32664 INIT / RETRY
+// ======================================================
+
+bool initMax()
+{
+  Serial.println();
+  Serial.println("[MAX] begin()");
+  PulseExpressStatus st = hub.begin();
+  printStatus("[MAX] begin", st);
+
+  if (st != PulseExpressStatus::Ok)
+  {
+    maxOnline = false;
+    running = false;
+    Serial.println("[MAX] INIT FAILED; other watch functions remain active.");
+    return false;
+  }
+
+  maxOnline = true;
+
+  PulseExpressVersion v = hub.version();
+  Serial.printf("[MAX] Firmware: %u.%u.%u\n", v.major, v.minor, v.patch);
+
+  Serial.print("[MAX] Calibration bytes: ");
+  Serial.println(hub.caps().calibVectorBytes);
+
+  haveCal = loadCalibration();
+
+  if (haveCal)
+  {
+    Serial.println("[CAL] Saved calibration found.");
+
+    if (!startLive())
+    {
+      Serial.println("[EST] Failed to start saved calibration.");
+      running = false;
+      return false;
+    }
+  }
+  else
+  {
+    running = false;
+    Serial.println();
+    Serial.println("NO SAVED BP CALIBRATION.");
+    Serial.println("Measure BP THREE times with a real cuff, then send:");
+    Serial.println("CAL SYS1 DIA1 SYS2 DIA2 SYS3 DIA3");
+  }
+
+  return true;
+}
+
+
+// ======================================================
+// COMMANDS
+// ======================================================
+
+void printHelp()
+{
+  Serial.println();
+  Serial.println("========== COMMANDS ==========");
+  Serial.println("HELP");
+  Serial.println("STATUS");
+  Serial.println("SCAN");
+  Serial.println("BEEP");
+  Serial.println("FALLTEST");
+  Serial.println("CAL SYS1 DIA1 SYS2 DIA2 SYS3 DIA3");
+  Serial.println("ERASE");
+  Serial.println("RESTART");
+  Serial.println("==============================");
+}
+
+void printSystemStatus()
+{
+  Serial.println();
+  Serial.println("========== SYSTEM ==========");
+
+  Serial.print("Display: ");
+  Serial.println(displayOK ? "OK" : "OFF");
+
+  Serial.print("MAX32664: ");
+  Serial.println(maxOnline ? "ONLINE" : "OFFLINE");
+
+  if (maxOnline)
+  {
+    PulseExpressVersion v = hub.version();
+    Serial.printf("Firmware: %u.%u.%u\n", v.major, v.minor, v.patch);
+    Serial.print("Expected calibration bytes: ");
+    Serial.println(hub.caps().calibVectorBytes);
+  }
+
+  Serial.print("Saved calibration: ");
+  Serial.println(haveCal ? "YES" : "NO");
+
+  Serial.print("Live estimation: ");
+  Serial.println(running ? "YES" : "NO");
+
+  Serial.print("MPU6050: ");
+  Serial.println(mpuOK ? "OK" : "OFF");
+
+  Serial.printf("Motion: acc=%.2fg gyro=%.1fdps moving=%s\n",
+                accelG, gyroDps, movingTooMuch ? "YES" : "NO");
+
+
+  Serial.print("Fall event: ");
+  Serial.println(fallDetected ? (fallAlarmMuted ? "ACKNOWLEDGED" : "ALERT") : "NONE");
+
+  Serial.println("============================");
+}
+
+void processCommand(String line)
+{
+  line.trim();
+
+  if (line.length() == 0)
+    return;
+
+  String cmd = line;
+  cmd.toUpperCase();
+
+  if (cmd == "HELP")
+  {
+    printHelp();
+    return;
+  }
+
+  if (cmd == "STATUS")
+  {
+    printSystemStatus();
+    return;
+  }
+
+  if (cmd == "SCAN")
+  {
+    scanI2C();
+    return;
+  }
+
+
+  if (cmd == "BEEP")
+  {
+    buzzerBeep(120);
+    return;
+  }
+
+  if (cmd == "FALLTEST")
+  {
+    triggerFallAlert();
+    return;
+  }
+
+  if (cmd == "ERASE")
+  {
+    prefs.clear();
+    haveCal = false;
+    running = false;
+    calLen = 0;
+    clearFilters();
+
+    Serial.println("[CAL] Calibration erased.");
+    Serial.println("Send RESTART before calibrating again.");
+    return;
+  }
+
+  if (cmd == "RESTART")
+  {
+    Serial.println("Restarting...");
+    delay(300);
+    ESP.restart();
+    return;
+  }
+
+  if (cmd.startsWith("CAL "))
+  {
+    if (!maxOnline)
+    {
+      Serial.println("[CAL] MAX32664 OFFLINE. Fix I2C / 0x55 first.");
+      return;
+    }
+
+    int s1, d1, s2, d2, s3, d3;
+
+    int matched = sscanf(
+      cmd.c_str(),
+      "CAL %d %d %d %d %d %d",
+      &s1, &d1,
+      &s2, &d2,
+      &s3, &d3
+    );
+
+    if (matched != 6)
+    {
+      Serial.println("Wrong format.");
+      Serial.println("Use: CAL SYS1 DIA1 SYS2 DIA2 SYS3 DIA3");
+      return;
+    }
+
+    runCalibration(
+      s1, d1,
+      s2, d2,
+      s3, d3
+    );
+
+    return;
+  }
+
+  Serial.println("Unknown command. Type HELP");
+}
+
+void pollSerial()
+{
+  if (!Serial.available())
+    return;
+
+  String line = Serial.readStringUntil('\n');
+  processCommand(line);
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup()
+{
+  Serial.begin(115200);
+  Serial.setTimeout(200);
+
+  delay(1200);
+
+  Serial.println();
+  Serial.println("================================================");
+  Serial.println(" XIAO ESP32-C3 SMARTWATCH - CLEAN CORE R5.7");
+  Serial.println(" MAX32664 + MPU6050 + GC9A01 + BUZZER + BOOT + FALL + LIVE UI R5.7");
+  Serial.println("================================================");
+
+  Serial.println("MAX RST  -> D2 / GPIO4");
+  Serial.println("MAX MFIO -> D1 / GPIO3");
+  Serial.println("MAX SDA  -> D4 / GPIO6");
+  Serial.println("MAX SCL  -> D5 / GPIO7");
+  Serial.println("D0 / GPIO2 -> FREE (reserved for future use)");
+  Serial.println("[R5.7 FIX] Fresh timestamp after MAX polling; live values will not be cleared immediately.");
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  pinMode(PIN_BOOT, INPUT_PULLUP);
+
+
+  // Display first so UI still works if a sensor is missing.
+  manualTftReset();
+  displayOK = tft->begin();
+  Serial.printf("[DISPLAY] begin=%s\n", displayOK ? "OK" : "FAIL");
+
+  if (displayOK)
+  {
+    tft->setRotation(0);
+    tft->setTextWrap(false);
+
+    tft->fillScreen(C_RED);
+    delay(180);
+    tft->fillScreen(C_GREEN);
+    delay(180);
+    tft->fillScreen(C_BLACK);
+
+    drawStaticUI();
+  }
+
+  // Legacy FW 40.2.2 BP vector needs >827 bytes.
+  size_t wireBuf = Wire.setBufferSize(1024);
+
+  Serial.print("[I2C] Wire buffer = ");
+  Serial.print(wireBuf);
+  Serial.println(" bytes");
+
+  if (wireBuf < 827)
+  {
+    Serial.println("[I2C] WARNING: buffer too small for 824-byte BP vector.");
+  }
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(250);
+
+  delay(300);
+
+  Serial.println("[MPU] init on shared I2C bus");
+  initMpu();
+
+  prefs.begin("pulse32664", false);
+
+  initMax();
+
+  // Scan after MAX boot sequence so 0x55 has the best chance to appear.
+  scanI2C();
+
+  buzzerBeep(70);
+
+  printHelp();
+  printSystemStatus();
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop()
+{
+  uint32_t now = millis();
+
+  pollSerial();
+
+  // MAX FIFO must be drained continuously.
+  // IMPORTANT:
+  // pollLive() can create NEW timestamps such as lastHrMs/uiHrMs
+  // and may also spend time beeping when a result becomes ready.
+  pollLive();
+
+  // R5.7 FIX:
+  // Refresh "now" AFTER pollLive().
+  // In R5.6, now was captured BEFORE pollLive(), while pollLive() later did:
+  //   uiHrMs = millis();
+  // Then code calculated:
+  //   now - uiHrMs
+  // with unsigned uint32_t.
+  // Because uiHrMs could be newer than now, subtraction wrapped to a huge
+  // number and immediately marked the brand-new value as stale.
+  now = millis();
+
+  handleBootButton(now);
+
+  // MPU at 50 Hz for motion/fall event processing.
+  if (mpuOK && now - lastMpuRead >= 20)
+  {
+    lastMpuRead = now;
+
+    if (!readMpu())
+    {
+      Serial.println("[MPU] read failed -> OFF");
+      mpuOK = false;
+      mpuAddr = 0;
+      movingTooMuch = false;
+      resetFallDetector();
+    }
+    else
+    {
+      updateFallDetection(now);
     }
   }
 
-  delay(20); // กัน FIFO ล้น ห้ามหน่วงมากกว่านี้
+  // Retry MAX without freezing the entire watch.
+  if (!maxOnline && now - lastMaxRetryMs >= 10000)
+  {
+    lastMaxRetryMs = now;
+    Serial.println("[MAX] retry...");
+    initMax();
+  }
+
+  // Retry MPU.
+  static uint32_t lastMpuRetry = 0;
+  if (!mpuOK && now - lastMpuRetry >= 5000)
+  {
+    lastMpuRetry = now;
+    initMpu();
+  }
+
+  // Use a FRESH timestamp for stale checks because functions above may have
+  // taken time or created newer measurement timestamps.
+  uint32_t staleNow = millis();
+
+  // Clear stale FILTER-READY flags only after their real hold time.
+  if (hrReady && (uint32_t)(staleNow - lastHrMs) > 5000UL)
+    hrReady = false;
+
+  if (spo2Ready && (uint32_t)(staleNow - lastSpO2Ms) > 5000UL)
+    spo2Ready = false;
+
+  if (bpReady && (uint32_t)(staleNow - lastBpMs) > 15000UL)
+    bpReady = false;
+
+  // Keep partial/latest display values long enough to read.
+  if (uiHrValid && (uint32_t)(staleNow - uiHrMs) > UI_HR_HOLD_MS)
+    uiHrValid = false;
+
+  if (uiSpO2Valid && (uint32_t)(staleNow - uiSpO2Ms) > UI_SPO2_HOLD_MS)
+    uiSpO2Valid = false;
+
+  if (uiBpValid && (uint32_t)(staleNow - uiBpMs) > UI_BP_HOLD_MS)
+    uiBpValid = false;
+
+  updateUI();
+  printLive();
+
+  delay(2);
 }
